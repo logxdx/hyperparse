@@ -180,6 +180,40 @@ add_executable(engine_lifecycle_test tests/engine_lifecycle_test.cpp)
 target_link_libraries(engine_lifecycle_test PRIVATE hp_core)
 set_target_properties(engine_lifecycle_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
+# HTTP server over Drogon 1.9.12 (static, with jsoncpp): -DDrogon_ROOT= or env
+# Drogon_ROOT points at an install; otherwise tools/build_drogon.sh builds it into
+# build/_deps/drogon on the first configure (~1 min). -DHP_SERVER=OFF skips it.
+option(HP_SERVER "build hyperparse_server" ON)
+if(HP_SERVER)
+  list(APPEND CMAKE_PREFIX_PATH ${HP_DEPS}/drogon)
+  find_package(Drogon CONFIG QUIET)
+  if(NOT Drogon_FOUND)
+    message(STATUS "Building Drogon into ${HP_DEPS}/drogon (log: ${HP_DEPS}/drogon-build.log)")
+    execute_process(COMMAND ${CMAKE_COMMAND} -E env Drogon_ROOT=${HP_DEPS}/drogon
+                            bash ${CMAKE_SOURCE_DIR}/tools/build_drogon.sh ${HP_DEPS}/drogon-src
+                    OUTPUT_FILE ${HP_DEPS}/drogon-build.log ERROR_FILE ${HP_DEPS}/drogon-build.log RESULT_VARIABLE _rc)
+    if(NOT _rc EQUAL 0)
+      message(FATAL_ERROR "building Drogon failed; see ${HP_DEPS}/drogon-build.log")
+    endif()
+    find_package(Drogon CONFIG REQUIRED)
+  endif()
+endif()
+if(Drogon_FOUND)
+  add_executable(hyperparse_server
+    server/main.cpp
+    server/server_config.cpp
+    server/bootstrap.cpp
+    server/request.cpp
+    server/metrics.cpp
+    server/parse_routes.cpp
+    server/model_routes.cpp
+    server/admin_routes.cpp
+    server/api_docs.cpp)
+  target_link_libraries(hyperparse_server PRIVATE hp_core Drogon::Drogon)
+  target_compile_options(hyperparse_server PRIVATE -O3 -march=native -Wall -Wextra)
+  set_target_properties(hyperparse_server PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+endif()
+
 # Self-contained install: `cmake --install build` (prefix dist unless --prefix) gives
 #   <dir>/bin/hyperparse, hyperparse_server   (RUNPATH $ORIGIN/../lib: nothing absolute)
 #   <dir>/lib/                      the TensorRT, ONNX-parser, builder-resource (this GPU) and PDFium libraries
