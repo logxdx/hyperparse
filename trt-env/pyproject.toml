@@ -1,0 +1,22 @@
+[project]
+name = "hyperparse-trt-env"
+version = "0.1.0"
+description = "TensorRT 11 libraries for building hyperparse without a system TensorRT install."
+requires-python = ">=3.10"
+dependencies = [
+    # Pinned to the TensorRT that hyperparse is built and tested with (headers:
+    # NVIDIA/TensorRT tag v11.5). The PyPI `tensorrt-cu13-libs` is an sdist that
+    # downloads the real wheel at build time, so take the wheel from NVIDIA's index.
+    "tensorrt-cu13-libs==11.5.0.63",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "nvidia"
+url = "https://pypi.nvidia.com"
+explicit = true
+
+[tool.uv.sources]
+tensorrt-cu13-libs = { index = "nvidia" }

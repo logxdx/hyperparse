@@ -1,0 +1,20 @@
+# Build output and the installed bundle
+/build/
+/dist/
+
+# Models live on Hugging Face (and in the HF + engine caches); test PDFs are local
+/models/
+/testdata/
+
+# Optional pip TensorRT (dependencies are fetched into build/_deps)
+/trt-env/.venv/
+
+# Runtime and tooling leftovers
+/uploads/
+__pycache__/
+*.log
+
+# Local dev scripts that need environments outside this repo
+/tools/formula_ref.py
+/tools/parity_layout.py
+/tools/rec_argmax_head.py
