@@ -123,11 +123,23 @@ endif()
 file(GLOB_RECURSE HP_CORE_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/core/*.cpp ${CMAKE_SOURCE_DIR}/src/core/*.cu)
 set_source_files_properties(${HP_CORE_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
 add_library(hp_core STATIC
-  ${HP_CORE_SOURCES})
+  ${HP_CORE_SOURCES}
+  src/pdf_render.cpp
+  src/render_pool.cpp
+  src/text_layer.cpp
+  src/glyph_decoder.cpp)
 target_include_directories(hp_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(hp_core SYSTEM PUBLIC ${TRT_INCLUDE_DIR} ${PDFIUM_DIR}/include ${JSON_INCLUDE_DIR})
 target_link_libraries(hp_core PUBLIC CUDA::cudart_static ${NVINFER} ${NVONNXPARSER} ${PDFIUM_DIR}/lib/libpdfium.so ${CMAKE_DL_LIBS})
 target_compile_options(hp_core PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>
   $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math>)
+
+add_executable(pdf_chars tests/pdf_chars.cpp)
+target_link_libraries(pdf_chars PRIVATE hp_core)
+set_target_properties(pdf_chars PROPERTIES BUILD_RPATH "${PDFIUM_DIR}/lib")
+
+add_executable(render_pool_test tests/render_pool_test.cpp)
+target_link_libraries(render_pool_test PRIVATE hp_core)
+set_target_properties(render_pool_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
