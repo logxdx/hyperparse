@@ -154,6 +154,11 @@ target_compile_options(hp_core PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>
   $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math>)
 
+add_executable(hyperparse src/hyperparse.cpp)
+target_link_libraries(hyperparse PRIVATE hp_core)
+target_compile_options(hyperparse PRIVATE -O3 -march=native -Wall -Wextra)
+set_target_properties(hyperparse PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
 add_executable(crop_batch_test tests/crop_batch_test.cu)
 target_link_libraries(crop_batch_test PRIVATE hp_core)
 target_compile_options(crop_batch_test PRIVATE -O3 --use_fast_math)
@@ -175,3 +180,61 @@ add_executable(engine_lifecycle_test tests/engine_lifecycle_test.cpp)
 target_link_libraries(engine_lifecycle_test PRIVATE hp_core)
 set_target_properties(engine_lifecycle_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
+# Self-contained install: `cmake --install build` (prefix dist unless --prefix) gives
+#   <dir>/bin/hyperparse, hyperparse_server   (RUNPATH $ORIGIN/../lib: nothing absolute)
+#   <dir>/lib/                      the TensorRT, ONNX-parser, builder-resource (this GPU) and PDFium libraries
+# Models come from the Hugging Face cache and the engine cache (model_store.h).
+set(_hp_bins hyperparse)
+if(TARGET hyperparse_server)
+  list(APPEND _hp_bins hyperparse_server)
+endif()
+set_target_properties(${_hp_bins} PROPERTIES INSTALL_RPATH "$ORIGIN/../lib")
+install(TARGETS ${_hp_bins} RUNTIME DESTINATION bin)
+# Each library under its SONAME, resolving the symlink chains of system installs.
+foreach(_lib ${NVINFER} ${NVONNXPARSER} ${PDFIUM_DIR}/lib/libpdfium.so)
+  file(REAL_PATH ${_lib} _real)
+  execute_process(COMMAND readelf -d ${_real} OUTPUT_VARIABLE _dyn)
+  string(REGEX MATCH "Library soname: \\[([^]]+)\\]" _m "${_dyn}")
+  set(_soname ${CMAKE_MATCH_1})
+  if(NOT _soname)
+    get_filename_component(_soname ${_lib} NAME)
+  endif()
+  install(FILES ${_real} DESTINATION lib RENAME ${_soname})
+endforeach()
+# libnvinfer dlopens its builder resource from its own directory when building
+# engines: ship the one for this GPU (HP_GPU_SM, detected). The 241 MB PTX
+# resource is only the fallback when that is missing (engines built without it
+# measured identical: IDL751 F1 and pages/s).
+set(HP_GPU_SM "" CACHE STRING "GPU compute capability for the builder resource, e.g. 89 (empty = detect)")
+if(NOT HP_GPU_SM)
+  execute_process(COMMAND nvidia-smi --query-gpu=compute_cap --format=csv,noheader
+                  OUTPUT_VARIABLE _cc OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  string(REGEX MATCH "^[0-9]+\\.[0-9]+" _cc "${_cc}")
+  string(REPLACE "." "" HP_GPU_SM "${_cc}")
+endif()
+set(_trt_res)
+if(HP_GPU_SM)
+  file(GLOB _trt_res ${TRT_LIB_DIR}/libnvinfer_builder_resource_sm${HP_GPU_SM}.so.*)
+endif()
+if(NOT _trt_res)
+  file(GLOB _trt_res ${TRT_LIB_DIR}/libnvinfer_builder_resource_ptx.so.*)
+  message(WARNING "no TensorRT builder resource for sm${HP_GPU_SM} in ${TRT_LIB_DIR}; installing the PTX fallback: ${_trt_res}")
+endif()
+install(FILES ${_trt_res} DESTINATION lib)
+install(FILES ${PDFIUM_DIR}/LICENSE DESTINATION share/licenses/pdfium)
+# Symlinks into a directory on PATH (empty = none). $ORIGIN resolves through the
+# link to <prefix>/bin, so the libraries are still found. Real files are never replaced.
+set(HP_LINK_DIR "$ENV{HOME}/.local/bin" CACHE PATH "where `cmake --install` links hyperparse/hyperparse_server (empty = no links)")
+if(HP_LINK_DIR)
+  install(CODE "
+    foreach(_b ${_hp_bins})
+      set(_link \"${HP_LINK_DIR}/\${_b}\")
+      if(EXISTS \"\${_link}\" AND NOT IS_SYMLINK \"\${_link}\")
+        message(WARNING \"not linking \${_link}: a real file is there\")
+      else()
+        file(MAKE_DIRECTORY \"${HP_LINK_DIR}\")
+        file(CREATE_LINK \"\${CMAKE_INSTALL_PREFIX}/bin/\${_b}\" \"\${_link}\" SYMBOLIC)
+        message(STATUS \"Linked: \${_link} -> \${CMAKE_INSTALL_PREFIX}/bin/\${_b}\")
+      endif()
+    endforeach()")
+endif()
