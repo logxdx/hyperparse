@@ -124,10 +124,18 @@ file(GLOB_RECURSE HP_CORE_SOURCES CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/src/core
 set_source_files_properties(${HP_CORE_SOURCES} PROPERTIES COMPILE_OPTIONS "-w")
 add_library(hp_core STATIC
   ${HP_CORE_SOURCES}
+  src/multi_resize.cu
+  src/dfine_layout.cpp
+  src/text_det.cpp
   src/pdf_render.cpp
   src/render_pool.cpp
+  src/crop_batch.cu
   src/text_layer.cpp
-  src/glyph_decoder.cpp)
+  src/glyph_decoder.cpp
+  src/formula.cu
+  src/rec_batcher.cpp
+  src/text_recognizer.cpp
+  src/model_set.cpp)
 target_include_directories(hp_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(hp_core SYSTEM PUBLIC ${TRT_INCLUDE_DIR} ${PDFIUM_DIR}/include ${JSON_INCLUDE_DIR})
 target_link_libraries(hp_core PUBLIC CUDA::cudart_static ${NVINFER} ${NVONNXPARSER} ${PDFIUM_DIR}/lib/libpdfium.so ${CMAKE_DL_LIBS})
@@ -135,9 +143,18 @@ target_compile_options(hp_core PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>
   $<$<COMPILE_LANGUAGE:CUDA>:-O3 --use_fast_math>)
 
+add_executable(crop_batch_test tests/crop_batch_test.cu)
+target_link_libraries(crop_batch_test PRIVATE hp_core)
+target_compile_options(crop_batch_test PRIVATE -O3 --use_fast_math)
+set_target_properties(crop_batch_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
 add_executable(pdf_chars tests/pdf_chars.cpp)
 target_link_libraries(pdf_chars PRIVATE hp_core)
 set_target_properties(pdf_chars PROPERTIES BUILD_RPATH "${PDFIUM_DIR}/lib")
+
+add_executable(formula_golden_test tests/formula_golden_test.cpp)
+target_link_libraries(formula_golden_test PRIVATE hp_core)
+set_target_properties(formula_golden_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
 add_executable(render_pool_test tests/render_pool_test.cpp)
 target_link_libraries(render_pool_test PRIVATE hp_core)
