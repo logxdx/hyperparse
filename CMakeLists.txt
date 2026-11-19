@@ -88,6 +88,8 @@ string(REGEX REPLACE "[^;]* ([0-9]+)" "\\1" _trt_ver "${_trt_ver}")
 string(REPLACE ";" "." _trt_ver "${_trt_ver}")
 message(STATUS "TensorRT: ${NVINFER} (headers ${_trt_ver} in ${TRT_INCLUDE_DIR})")
 
+find_package(CURL REQUIRED)  # headers only: libcurl is dlopen'ed for model downloads
+
 # PDFium: run-llama's fork (chromium/8058): the stock API plus per-char char codes
 # and the font glyph-name/encoding/ToUnicode queries that glyph recovery uses.
 # -DPDFIUM_DIR= or env PDFIUM_DIR points at an extracted release.
@@ -135,9 +137,12 @@ add_library(hp_core STATIC
   src/formula.cu
   src/rec_batcher.cpp
   src/text_recognizer.cpp
-  src/model_set.cpp)
+  src/model_set.cpp
+  src/engine_build.cpp
+  src/model_store.cpp)
 target_include_directories(hp_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(hp_core SYSTEM PUBLIC ${TRT_INCLUDE_DIR} ${PDFIUM_DIR}/include ${JSON_INCLUDE_DIR})
+target_include_directories(hp_core SYSTEM PRIVATE ${CURL_INCLUDE_DIRS})
 target_link_libraries(hp_core PUBLIC CUDA::cudart_static ${NVINFER} ${NVONNXPARSER} ${PDFIUM_DIR}/lib/libpdfium.so ${CMAKE_DL_LIBS})
 target_compile_options(hp_core PRIVATE
   $<$<COMPILE_LANGUAGE:CXX>:-O3 -march=native -Wall -Wextra>
