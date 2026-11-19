@@ -1,0 +1,399 @@
+#include "page_pipeline.h"
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cmath>
+#include <condition_variable>
+#include <cstring>
+#include <deque>
+#include <exception>
+#include <mutex>
+#include <stdexcept>
+#include <thread>
+#include <vector>
+
+#include "assemble.h"
+#include "multi_resize.h"
+#include "ocr_stage.h"
+#include "pdf_render.h"
+#include "core/common/cuda/cuda_check.h"
+
+namespace hp {
+namespace {
+
+using Clock = std::chrono::steady_clock;
+double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
+
+const char *status_text(int s) {
+  switch (s) {
+    case RenderPool::kRenderFailed: return "render failed";
+    case RenderPool::kWorkerCrashed: return "page worker crashed";
+    case RenderPool::kTimedOut: return "page timed out";
+    default: return "ok";
+  }
+}
+
+// A page between the GPU thread and the assembly thread.
+struct PageWork {
+  PageResult result;                          // filled progressively
+  std::vector<PageLine> items;                // native + OCR items, before line merging
+  std::vector<std::vector<uint8_t>> crop_px;  // display-formula crops (packed BGR), copied out of the slot
+  std::vector<std::array<int, 3>> crop_meta;  // {layout index, w, h}
+};
+
+// Copy every display-formula crop out of the page slot so the slot can be reused
+// while the formulas wait for the assembly thread.
+void copy_formula_crops(const uint8_t *page, int w, int h, PageWork &pw) {
+  const auto &boxes = pw.result.layout;
+  for (size_t i = 0; i < boxes.size(); ++i) {
+    const auto &b = boxes[i];
+    if (kDfineLabels[b.cls] != "Formula") continue;
+    const int x0 = std::clamp(static_cast<int>(b.x0), 0, w - 1), y0 = std::clamp(static_cast<int>(b.y0), 0, h - 1);
+    const int x1 = std::clamp(static_cast<int>(std::ceil(b.x1)), x0 + 1, w);
+    const int y1 = std::clamp(static_cast<int>(std::ceil(b.y1)), y0 + 1, h);
+    const size_t row = static_cast<size_t>(x1 - x0) * 3;
+    std::vector<uint8_t> px(row * (y1 - y0));
+    for (int y = y0; y < y1; ++y)
+      std::memcpy(px.data() + (y - y0) * row, page + (static_cast<size_t>(y) * w + x0) * 3, row);
+    pw.crop_px.push_back(std::move(px));
+    pw.crop_meta.push_back({static_cast<int>(i), x1 - x0, y1 - y0});
+  }
+}
+
+// ── assembly thread ─────────────────────────────────────────────────────────
+// Drains every page queued so far, decodes all of their formula crops together,
+// then assembles and delivers each page. Owns its own statistics; they are read
+// only after join().
+class AssemblyStage {
+ public:
+  AssemblyStage(ModelSet &models, const PageSink &sink) : models_(models), sink_(sink), thread_([this] { loop(); }) {}
+  ~AssemblyStage() { close(); }
+
+  void push(PageWork &&w) {
+    {
+      std::lock_guard l(mu_);
+      q_.push_back(std::move(w));
+    }
+    cv_.notify_one();
+  }
+  // Discard queued pages (after an error elsewhere) instead of delivering them.
+  void cancel() {
+    std::lock_guard l(mu_);
+    cancelled_ = true;
+    q_.clear();
+  }
+  [[nodiscard]] bool failed() const {
+    std::lock_guard l(mu_);
+    return error_ != nullptr;
+  }
+  // Finish queued work and join; rethrows the first error from the thread.
+  void finish() {
+    close();
+    if (error_) std::rethrow_exception(error_);
+  }
+
+  int formulas = 0, formula_batches = 0, lines = 0;
+  double formula_ms = 0, assemble_ms = 0;
+
+ private:
+  void close() {
+    {
+      std::lock_guard l(mu_);
+      closed_ = true;
+    }
+    cv_.notify_one();
+    if (thread_.joinable()) thread_.join();
+  }
+
+  void loop() {
+    for (;;) {
+      std::vector<PageWork> batch;
+      {
+        std::unique_lock l(mu_);
+        cv_.wait(l, [&] { return !q_.empty() || closed_; });
+        if (q_.empty()) return;
+        while (!q_.empty()) {
+          batch.push_back(std::move(q_.front()));
+          q_.pop_front();
+        }
+        if (cancelled_ || error_) continue;
+      }
+      try {
+        process(batch);
+      } catch (...) {
+        std::lock_guard l(mu_);
+        if (!error_) error_ = std::current_exception();
+      }
+    }
+  }
+
+  void process(std::vector<PageWork> &batch) {
+    std::vector<FormulaCrop> crops;
+    for (auto &w : batch)
+      for (size_t k = 0; k < w.crop_px.size(); ++k)
+        crops.push_back({w.crop_px[k].data(), static_cast<size_t>(w.crop_meta[k][1]) * 3, w.crop_meta[k][1],
+                         w.crop_meta[k][2]});
+    std::vector<std::string> latex;
+    if (!crops.empty()) {
+      const auto t = Clock::now();
+      latex = models_.formula().run(crops, models_.formula_stream());
+      formula_ms += ms_since(t);
+      formulas += static_cast<int>(crops.size());
+      ++formula_batches;
+    }
+    size_t c = 0;
+    for (auto &w : batch) {
+      PageResult &r = w.result;
+      if (r.ok) {
+        for (size_t k = 0; k < w.crop_px.size(); ++k, ++c) r.formulas.push_back({w.crop_meta[k][0], latex[c], 1.f});
+        const auto t = Clock::now();
+        AssembledPage page =
+            assemble_page(r.page, r.width, r.height, r.layout, w.items, merge_into_lines(w.items), r.formulas);
+        assemble_ms += ms_since(t);
+        r.markdown = std::move(page.markdown);
+        r.tables = std::move(page.tables);
+        r.reading_order = std::move(page.order);
+        r.lines = std::move(page.lines);
+        lines += static_cast<int>(r.lines.size());
+      }
+      sink_(std::move(r));
+    }
+  }
+
+  ModelSet &models_;
+  const PageSink &sink_;
+  mutable std::mutex mu_;
+  std::condition_variable cv_;
+  std::deque<PageWork> q_;
+  bool closed_ = false, cancelled_ = false;
+  std::exception_ptr error_;
+  std::thread thread_;  // last: starts after every other member is initialised
+};
+
+// ── GPU thread ──────────────────────────────────────────────────────────────
+class DocumentRun {
+ public:
+  DocumentRun(ModelSet &m, RenderPool &pool, const ParseOptions &opt, const PageSink &sink)
+      : m_(m), pool_(pool), opt_(opt), sink_(sink) {
+    job_opt_.ocr_dpi = opt.ocr_dpi;
+    job_opt_.force = opt.ocr == OcrMode::kAll ? 1 : opt.ocr == OcrMode::kNone ? 2 : 0;
+  }
+
+  ParseStats run(std::span<const uint8_t> pdf) {
+    const auto t_start = Clock::now();
+    {
+      PdfRaster probe(pdf.data(), pdf.size());  // parent-side: page count, and reject unreadable PDFs early
+      if (!probe.ok()) throw InvalidPdfError("not a readable PDF");
+      n_pages_ = probe.page_count();
+    }
+    if (opt_.max_pages > 0 && n_pages_ > opt_.max_pages) throw PageLimitError(n_pages_, opt_.max_pages);
+    if (opt_.on_start) opt_.on_start(n_pages_);
+    stats_.pages = n_pages_;
+    if (n_pages_ == 0) return stats_;
+    gen_ = pool_.set_document(pdf);
+    received_.assign(n_pages_, 0);
+    for (int s = pool_.slots() - 1; s >= 0; --s) free_slots_.push_back(s);
+    const int formula_steps0 = m_.has_formula() ? m_.formula().steps_run : 0;
+
+    AssemblyStage assembly(m_, sink_);
+    assembly_ = &assembly;
+    try {
+      submit_ready();
+      for (int done = 0; done < n_pages_;) {
+        const RenderPool::Done d = pool_.wait_done();
+        if (!accept(d)) continue;
+        --outstanding_;
+        ++done;
+        if (d.status != RenderPool::kOk) {
+          fail_page(d);
+          continue;
+        }
+        LaneJob &job = lanes_[next_lane_];
+        if (job.busy) finish(next_lane_);
+        start(next_lane_, d);
+        next_lane_ ^= 1;
+        if (assembly.failed()) throw std::runtime_error("assembly failed");  // replaced by its own error below
+      }
+      for (int i = 0; i < ModelSet::kLanes; ++i)
+        if (lanes_[i].busy) finish(i);
+    } catch (...) {
+      abort_and_drain(assembly);
+      pool_.release_document();
+      assembly.finish();  // the assembly thread's error, if any, is the root cause
+      throw;
+    }
+    pool_.release_document();  // every job is done: nobody reads the memfd any more
+    assembly.finish();
+
+    stats_.formulas = assembly.formulas;
+    stats_.formula_batches = assembly.formula_batches;
+    stats_.formula_ms = assembly.formula_ms;
+    stats_.assemble_ms = assembly.assemble_ms;
+    stats_.lines = assembly.lines;
+    stats_.formula_steps = m_.has_formula() ? m_.formula().steps_run - formula_steps0 : 0;
+    stats_.wall_ms = ms_since(t_start);
+    return stats_;
+  }
+
+ private:
+  struct LaneJob {
+    bool busy = false;
+    RenderPool::Done done{};
+    PageText pt;
+    Route rt;
+    PageWork work;
+    Clock::time_point t0;
+  };
+
+  // Ignore duplicates and stale results. The supervisor may report a crashed
+  // worker's page that was in fact delivered, and a previous document's late
+  // duplicates carry an older generation.
+  bool accept(const RenderPool::Done &d) {
+    if (d.gen != gen_ || d.page < 0 || d.page >= n_pages_ || received_[d.page]) return false;
+    received_[d.page] = 1;
+    return true;
+  }
+
+  void submit_ready() {
+    while (next_page_ < n_pages_ && !free_slots_.empty()) {
+      const int slot = free_slots_.back();
+      free_slots_.pop_back();
+      pool_.submit(next_page_++, slot, gen_, job_opt_);
+      ++outstanding_;
+    }
+  }
+
+  void release_slot(int slot) {
+    free_slots_.push_back(slot);
+    submit_ready();
+  }
+
+  void fail_page(const RenderPool::Done &d) {
+    ++stats_.failed;
+    PageWork w;
+    w.result.page = d.page;
+    w.result.error = status_text(d.status);
+    release_slot(d.slot);
+    assembly_->push(std::move(w));
+  }
+
+  // Upload, resize, layout, OCR. Layout stays in flight on the lane stream.
+  void start(int lane_index, const RenderPool::Done &d) {
+    LaneJob &job = lanes_[lane_index];
+    LayoutLane &lane = m_.lane(lane_index);
+    job = LaneJob{};
+    job.busy = true;
+    job.done = d;
+    job.t0 = Clock::now();
+    if (!deserialize(pool_.meta(d.slot), d.meta_len, job.pt, job.rt)) throw std::runtime_error("corrupt page metadata");
+    ++stats_.routes[job.rt.kind];
+    stats_.text_ms += d.text_ms;
+    stats_.render_ms += d.render_ms;
+
+    const PageGeometry g{d.w, d.h, d.dpi};
+    const size_t bytes = static_cast<size_t>(d.w) * d.h * 3;
+    uint8_t *page = lane.page_buffer(bytes);
+    CUDA_CHECK(cudaMemcpyAsync(page, pool_.pixels(d.slot), bytes, cudaMemcpyHostToDevice, lane.stream));
+    const OcrPlan plan = plan_ocr(m_, job.rt, g, true);
+    ResizeTable table;
+    table.add(lane.layout.resize_spec(d.w, d.h));
+    if (plan.need_det && !plan.region_det) table.add(m_.det().resize_spec(d.w, d.h));
+    launch_multi_resize(page, static_cast<size_t>(d.w) * 3, d.w, d.h, table, lane.stream);
+    CUDA_CHECK(cudaEventRecord(lane.resized, lane.stream));
+    lane.layout.enqueue(lane.stream);
+
+    PageResult &r = job.work.result;
+    r.page = d.page;
+    r.width = d.w;
+    r.height = d.h;
+    r.dpi = d.dpi;
+    r.route = job.rt.kind;
+    r.route_reasons = job.rt.reasons;
+    r.ms.text = d.text_ms;
+    r.ms.render = d.render_ms;
+    const float k = g.px_per_pt();
+    for (const auto &q : job.rt.regions) r.ocr_regions.push_back({q.x0 * k, q.y0 * k, q.x1 * k, q.y1 * k});
+    for (const auto &it : job.pt.items)
+      if (!it.dropped)
+        job.work.items.push_back({it.text, it.box.x0 * k, it.box.y0 * k, it.box.x1 * k, it.box.y1 * k, 1.f, false});
+
+    if (!plan.ocr) return;
+    const auto t_ocr = Clock::now();
+    OcrPageResult ocr = run_ocr(m_, lane, plan, job.pt, job.rt, g);
+    stats_.ocr_ms += ms_since(t_ocr);
+    stats_.det_ms += ocr.det_ms;
+    stats_.rec_ms += ocr.rec_ms;
+    stats_.det_boxes += ocr.det_boxes;
+    stats_.rec_boxes += ocr.rec_boxes;
+    stats_.direct_rec_boxes += ocr.direct_rec_boxes;
+    if (plan.region_det) {
+      ++stats_.region_det_pages;
+      stats_.region_det_canvas_px += ocr.canvas_px;
+    }
+    r.det_boxes = ocr.det_boxes;
+    r.rec_boxes = ocr.rec_boxes;
+    r.region_det = plan.region_det;
+    for (auto &l : ocr.lines) job.work.items.push_back(std::move(l));
+  }
+
+  // Wait for the lane's layout, take what the assembly thread needs out of the
+  // slot, free the slot, hand the page on.
+  void finish(int lane_index) {
+    LaneJob &job = lanes_[lane_index];
+    LayoutLane &lane = m_.lane(lane_index);
+    const auto t_wait = Clock::now();
+    lane.stream.sync();
+    stats_.layout_wait_ms += ms_since(t_wait);
+    PageWork &w = job.work;
+    w.result.layout = lane.layout.collect();
+    w.result.ok = true;
+    if (opt_.formulas && m_.has_formula()) copy_formula_crops(pool_.pixels(job.done.slot), job.done.w, job.done.h, w);
+    w.result.ms.gpu = ms_since(job.t0);
+    job.busy = false;
+    release_slot(job.done.slot);
+    assembly_->push(std::move(w));
+  }
+
+  // Error path: stop feeding work, wait for every job already submitted (their
+  // slots are being written), quiesce the GPU, and drop undelivered pages.
+  void abort_and_drain(AssemblyStage &assembly) noexcept {
+    assembly.cancel();
+    next_page_ = n_pages_;  // submit nothing more
+    try {
+      while (outstanding_ > 0) {
+        if (accept(pool_.wait_done())) --outstanding_;
+      }
+    } catch (...) {
+      // Pool stalled or dead; nothing more can be drained. The engine reports
+      // the original error, and the next parse fails fast on the dead pool.
+    }
+    try {
+      m_.synchronize();
+    } catch (...) {
+    }
+  }
+
+  ModelSet &m_;
+  RenderPool &pool_;
+  const ParseOptions &opt_;
+  const PageSink &sink_;
+  PageJobOptions job_opt_;
+  AssemblyStage *assembly_ = nullptr;
+
+  ParseStats stats_;
+  int n_pages_ = 0, next_page_ = 0, outstanding_ = 0, next_lane_ = 0;
+  uint32_t gen_ = 0;
+  std::vector<char> received_;
+  std::vector<int> free_slots_;
+  std::array<LaneJob, ModelSet::kLanes> lanes_;
+};
+
+}  // namespace
+
+ParseStats parse_document(ModelSet &models, RenderPool &pool, std::span<const uint8_t> pdf, const ParseOptions &opt,
+                          const PageSink &sink) {
+  return DocumentRun(models, pool, opt, sink).run(pdf);
+}
+
+}  // namespace hp

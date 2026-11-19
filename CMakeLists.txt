@@ -140,8 +140,12 @@ add_library(hp_core STATIC
   src/rec_batcher.cpp
   src/text_recognizer.cpp
   src/model_set.cpp
+  src/ocr_stage.cpp
+  src/page_pipeline.cpp
+  src/page_json.cpp
   src/engine_build.cpp
-  src/model_store.cpp)
+  src/model_store.cpp
+  src/engine.cpp)
 target_include_directories(hp_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 target_include_directories(hp_core SYSTEM PUBLIC ${TRT_INCLUDE_DIR} ${PDFIUM_DIR}/include ${JSON_INCLUDE_DIR})
 target_include_directories(hp_core SYSTEM PRIVATE ${CURL_INCLUDE_DIRS})
@@ -166,4 +170,8 @@ set_target_properties(formula_golden_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR}
 add_executable(render_pool_test tests/render_pool_test.cpp)
 target_link_libraries(render_pool_test PRIVATE hp_core)
 set_target_properties(render_pool_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
+add_executable(engine_lifecycle_test tests/engine_lifecycle_test.cpp)
+target_link_libraries(engine_lifecycle_test PRIVATE hp_core)
+set_target_properties(engine_lifecycle_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
