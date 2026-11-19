@@ -1,0 +1,52 @@
+#pragma once
+// Page assembly: layout boxes + text lines (native and OCR) + formula LaTeX ->
+// reading order + Markdown, via the XY-cut reading order (core/layout) and
+// Markdown renderer. hp adds what D-FINE's 12-class layout lacks for papers:
+// native word items merged into lines, doc_title promotion (largest Title on the
+// first page) and formula_number boxes synthesised from "(n)" lines beside
+// display formulas (core/markdown folds those into \tag{n}).
+
+#include <string>
+#include <vector>
+
+#include "dfine_layout.h"
+
+namespace hp {
+
+struct PageLine {
+  std::string text;
+  float x0, y0, x1, y1;  // page px
+  float conf = 1.f;
+  bool ocr = false;
+  bool inline_ocr = false;  // read from pixels at a text-layer box: belongs inside a native line
+};
+
+struct PageFormula {
+  int layout_index;  // index into the layout vector passed to assemble_page
+  std::string latex;
+  float score = 1.f;
+};
+
+struct PageTable {
+  int layout_index;      // index into the layout vector passed to assemble_page
+  std::string markdown;  // pipe table (table_grid.h)
+};
+
+struct AssembledPage {
+  std::string markdown;
+  std::vector<PageTable> tables;
+  std::vector<int> order;  // reading order over `lines` (after line merging)
+  std::vector<PageLine> lines;
+};
+
+// Merge word/phrase items (extraction order) into visual lines. inline_ocr items are
+// first slotted in after their left neighbour on the same line.
+std::vector<PageLine> merge_into_lines(const std::vector<PageLine> &items);
+
+// `items` are the spans before merge_into_lines (table cells come from them);
+// `lines` are the merged lines.
+AssembledPage assemble_page(int page_index, int w, int h, const std::vector<LayoutBox> &layout,
+                            const std::vector<PageLine> &items, std::vector<PageLine> lines,
+                            const std::vector<PageFormula> &formulas);
+
+}  // namespace hp

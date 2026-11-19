@@ -133,6 +133,8 @@ add_library(hp_core STATIC
   src/render_pool.cpp
   src/crop_batch.cu
   src/text_layer.cpp
+  src/assemble.cpp
+  src/table_grid.cpp
   src/glyph_decoder.cpp
   src/formula.cu
   src/rec_batcher.cpp
