@@ -38,6 +38,8 @@ struct ModelConfig {
   bool formula = true;           // load PP-FormulaNet-S
   bool tables = true;            // load LayoutNet (table structure in Table layout regions)
   bool ordernet = true;          // load OrderNet (reading order and block structure)
+  std::string tables_precision = "fp16";  // LayoutNet plan: fp16 | int8
+  std::string order_precision = "fp16";   // OrderNet plan: fp16 | int8
   RecMode rec = RecMode::kColumnBudget;
 };
 

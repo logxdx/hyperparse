@@ -62,19 +62,25 @@ std::vector<PlanSpec> make_specs() {
                  {"ck", ckv(1), ckv(B), ckv(B)},
                  {"cv", ckv(1), ckv(B), ckv(B)}}},
                3.0});
-  // LayoutNet: FP32 (decoding thresholds logits at 0, -1.5, -4 and -8), units 2..1500 (pages with
-  // more skip the model, as the reference does). Context memory at N = 1500: ~280 MB.
+  // LayoutNet, FP16 (autocast; attention masks -3e4 instead of -1e9 so they fit) or INT8 (Q/DQ,
+  // rest FP16). Units 2..1500 (pages with more skip the model, as the reference does).
+  // OmniDocBench table pages, CPU reference: TEDS FP32 0.511, FP16 0.511, INT8 0.498.
   auto units = [](int64_t n) { return std::vector<int64_t>{1, n}; };
-  s.push_back({"tablenet.onnx", kTableNetPlan, ModelGroup::kTables,
-               {{{"feats", {1, 2, 68}, {1, 256, 68}, {1, 1500, 68}},
-                 {"mask", units(2), units(256), units(1500)},
-                 {"pairf", {1, 2, 2, 2}, {1, 256, 256, 2}, {1, 1500, 1500, 2}},
-                 fixed("image", {1, 1, 1024, 1024}),
-                 {"boxes", {1, 2, 4}, {1, 256, 4}, {1, 1500, 4}},
-                 fixed("valid", {1, 2})}}});
-  // OrderNet: FP32, lines 2..2048 (longer pages keep XY-cut). Context memory at 2048: ~210 MB.
-  s.push_back({"order.onnx", kOrderNetPlan, ModelGroup::kOrder,
-               {{{"feats", {1, 2, 16}, {1, 256, 16}, {1, 2048, 16}}, {"mask", {1, 2}, {1, 256}, {1, 2048}}}}});
+  for (const char *v : {"fp16", "int8"})
+    s.push_back({std::string("tablenet_") + v + ".onnx", table_plan(v), ModelGroup::kTables,
+                 {{{"feats", {1, 2, 68}, {1, 256, 68}, {1, 1500, 68}},
+                   {"mask", units(2), units(256), units(1500)},
+                   {"pairf", {1, 2, 2, 2}, {1, 256, 256, 2}, {1, 1500, 1500, 2}},
+                   fixed("image", {1, 1, 1024, 1024}),
+                   {"boxes", {1, 2, 4}, {1, 256, 4}, {1, 1500, 4}},
+                   fixed("valid", {1, 2})}},
+                 2.0, v});
+  // OrderNet, FP16 or INT8 (both scored like FP32 on olmOCR-bench / OmniDocBench order), lines
+  // 2..2048 (longer pages keep XY-cut).
+  for (const char *v : {"fp16", "int8"})
+    s.push_back({std::string("order_") + v + ".onnx", order_plan(v), ModelGroup::kOrder,
+                 {{{"feats", {1, 2, 16}, {1, 256, 16}, {1, 2048, 16}}, {"mask", {1, 2}, {1, 256}, {1, 2048}}}},
+                 2.0, v});
   return s;
 }
 

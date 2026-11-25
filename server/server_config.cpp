@@ -31,7 +31,9 @@ constexpr const char *kUsage =
     "  --no-ocr               don't load det/rec (text layer + layout only)\n"
     "  --no-formula           don't load the formula model\n"
     "  --no-tables            don't load LayoutNet (table cells from text geometry instead)\n"
-    "  --no-ordernet          don't load OrderNet (reading order by XY-cut instead)\n";
+    "  --no-ordernet          don't load OrderNet (reading order by XY-cut instead)\n"
+    "  --tables-precision P   LayoutNet engine: fp16 (default) | int8\n"
+    "  --order-precision P    OrderNet engine: fp16 (default) | int8\n";
 
 int to_int(const std::string &k, const std::string &v) {
   char *end = nullptr;
@@ -91,6 +93,11 @@ ServerConfig parse_server_config(int argc, char **argv) {
     else if (k == "--no-formula") c.engine.models.formula = false;
     else if (k == "--no-tables") c.engine.models.tables = false;
     else if (k == "--no-ordernet") c.engine.models.ordernet = false;
+    else if (k == "--tables-precision" || k == "--order-precision") {
+      const std::string v = next();
+      if (v != "fp16" && v != "int8") throw std::runtime_error(k + " fp16|int8");
+      (k == "--tables-precision" ? c.engine.models.tables_precision : c.engine.models.order_precision) = v;
+    }
     else if (k == "--rec") {
       const std::string v = next();
       if (v != "budget" && v != "bucket") throw std::runtime_error("--rec budget|bucket");

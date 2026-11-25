@@ -1,6 +1,6 @@
 #pragma once
 // LayoutNet (OCRia-nano-1 tablenet.onnx: 6-layer transformer over text units + CNN image branch,
-// 4.27M params) on TensorRT, FP32. Inputs feats [1,N,68], mask [1,N] bool, pairf [1,N,N,2],
+// 4.27M params) on TensorRT, FP16 or INT8 (tablenet_<p>.plan). Inputs feats [1,N,68], mask [1,N] bool, pairf [1,N,N,2],
 // image [1,1,1024,1024], boxes [1,N,4], valid [1,2]; outputs node [1,N,2], pair [1,5,N,N],
 // cls [1,N,13]. N is dynamic, 2..kMaxUnits (one optimization profile).
 

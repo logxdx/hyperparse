@@ -1,5 +1,5 @@
 #pragma once
-// OrderNet (Indra OCR's order.onnx, 0.73M params) on TensorRT, FP32: feats [1,N,16] + mask [1,N]
+// OrderNet (Indra OCR's order.onnx, 0.73M params) on TensorRT, FP16 or INT8 (order_<p>.plan): feats [1,N,16] + mask [1,N]
 // bool -> a [1,N,N] (pairwise order), cls [1,N,10] (block class), same [1,N,N] (same block),
 // tab [1,3,N,N] (table relations; computed by the graph, not used). N is dynamic, 2..kMaxLines.
 

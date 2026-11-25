@@ -17,7 +17,7 @@ Apache-2.0). These files reproduce the checks it was validated with.
 ## Checks
 
 - `build/tablenet_decode_test dumps/x ...`: decoding (`decode.cpp`) byte for byte.
-- `build/tablenet_parity doc.pdf dumps/x <engine cache>/tablenet.plan`: units, ruling
+- `build/tablenet_parity doc.pdf dumps/x <engine cache>/tablenet_fp16.plan`: units, ruling
   lines, image branch, features, TensorRT logits, decoded tables and the whole page, per page.
 
 Results when this was ported (OmniDocBench table pages as image PDFs; olmOCR-bench subset):

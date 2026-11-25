@@ -13,8 +13,10 @@ inline constexpr const char *kModelRepo = "logxdx/hyperparse-models";
 struct ModelNeeds {
   bool ocr = true;
   bool formula = true;
-  bool tables = true;    // LayoutNet (tablenet.onnx)
-  bool ordernet = true;  // OrderNet (order.onnx)
+  bool tables = true;    // LayoutNet (tablenet_<precision>.onnx)
+  bool ordernet = true;  // OrderNet (order_<precision>.onnx)
+  std::string tables_precision = "fp16";  // fp16 | int8
+  std::string order_precision = "fp16";   // fp16 | int8
 };
 
 // Returns a directory for ModelConfig::dir holding every plan and asset `needs`

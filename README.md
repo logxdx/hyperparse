@@ -18,6 +18,8 @@ doesn't already have good text, and no Python on the hot path.
 - **Layout**: 12 region classes per page (text, title, table, picture, formula, caption, code, stamp, …)
 - **Reading order**: OrderNet orders the page's lines and groups them into blocks (paragraphs,
   headings, lists), around D-FINE's tables and formulas; `--no-ordernet` falls back to XY-cut
+- **Precision**: LayoutNet and OrderNet run as FP16 TensorRT engines (`--tables-precision` /
+  `--order-precision int8` for INT8); see `tools/quant`
 - **Text**: the PDF's own text layer when it is usable, OCR where it isn't (per page or per region)
 - **Formulas**: display formulas as LaTeX
 - **Tables**: table structure from LayoutNet (rows, columns, spanning cells, header rows) as HTML

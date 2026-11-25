@@ -83,9 +83,16 @@ bool needed(ModelGroup g, ModelNeeds n) {
          (g == ModelGroup::kTables && n.tables) || (g == ModelGroup::kOrder && n.ordernet);
 }
 
+// A plan is needed when its group is, and (models with precision variants) it is the chosen one.
+bool needed(const PlanSpec &s, const ModelNeeds &n) {
+  if (!needed(s.group, n)) return false;
+  if (s.variant.empty()) return true;
+  return s.variant == (s.group == ModelGroup::kTables ? n.tables_precision : n.order_precision);
+}
+
 bool plans_ready(const fs::path &dir, ModelNeeds n) {
   for (const PlanSpec &s : plan_specs())
-    if (needed(s.group, n) && !fs::exists(dir / s.plan)) return false;
+    if (needed(s, n) && !fs::exists(dir / s.plan)) return false;
   for (const ModelAsset &a : model_assets())
     if (needed(a.group, n) && !fs::exists(dir / a.path)) return false;
   return true;
@@ -301,7 +308,7 @@ bool snapshot_covers(const fs::path &snap, ModelNeeds needs) {
     return false;
   };
   for (const PlanSpec &s : plan_specs())
-    if (needed(s.group, needs) && !listed(s.onnx)) return false;
+    if (needed(s, needs) && !listed(s.onnx)) return false;
   for (const ModelAsset &a : model_assets())
     if (needed(a.group, needs) && !listed(a.path)) return false;
   return true;
@@ -440,7 +447,7 @@ void ensure_engines(const fs::path &onnx_dir, const fs::path &plan_dir, ModelNee
   }
   std::vector<const PlanSpec *> todo;
   for (const PlanSpec &s : plan_specs())
-    if (needed(s.group, needs) && !fs::exists(plan_dir / s.plan)) todo.push_back(&s);
+    if (needed(s, needs) && !fs::exists(plan_dir / s.plan)) todo.push_back(&s);
   if (!todo.empty())
     std::fprintf(stderr, "preparing %zu TensorRT engine(s) with TensorRT %s in %s (one-time; minutes)\n", todo.size(),
                  trt_version().c_str(), plan_dir.c_str());

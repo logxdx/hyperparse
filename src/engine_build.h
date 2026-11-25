@@ -24,12 +24,13 @@ struct PlanSpec {
   ModelGroup group;
   std::vector<Profile> profiles;
   double workspace_gb = 2.0;
+  std::string variant;  // precision variant ("fp16", "int8") for models that have several; "" = the only one
 };
 
-// LayoutNet (table structure): OCRia-nano-1's tablenet.onnx, mirrored unmodified in kModelRepo.
-inline constexpr const char *kTableNetPlan = "tablenet.plan";
-// OrderNet (reading order and block structure): Indra OCR's order.onnx, mirrored in kModelRepo.
-inline constexpr const char *kOrderNetPlan = "order.plan";
+// LayoutNet (OCRia-nano-1's tablenet) and OrderNet (Indra OCR's order) come in reduced-precision
+// variants: tablenet_<v>.onnx / order_<v>.onnx -> tablenet_<v>.plan / order_<v>.plan, v = fp16 | int8.
+inline std::string table_plan(const std::string &variant) { return "tablenet_" + variant + ".plan"; }
+inline std::string order_plan(const std::string &variant) { return "order_" + variant + ".plan"; }
 
 // Every engine hp loads, in build order.
 const std::vector<PlanSpec> &plan_specs();

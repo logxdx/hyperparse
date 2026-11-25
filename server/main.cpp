@@ -18,7 +18,9 @@ int main(int argc, char **argv) try {
   hp::server::ServerConfig cfg = hp::server::parse_server_config(argc, argv);
   // Before the Engine: downloads/builds missing models in a child process.
   cfg.engine.models.dir = hp::prepare_models(cfg.engine.models.dir, {cfg.engine.models.ocr, cfg.engine.models.formula, cfg.engine.models.tables,
-                                                                         cfg.engine.models.ordernet});
+                                                                         cfg.engine.models.ordernet,
+                                                                         cfg.engine.models.tables_precision,
+                                                                         cfg.engine.models.order_precision});
 
   // First: the Engine forks its page-worker supervisor, which must happen
   // before any other thread exists (render_pool.h).

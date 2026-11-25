@@ -41,6 +41,8 @@ constexpr const char *kUsage =
     "  --no-tables            table cells from geometry instead of the LayoutNet model\n"
     "  --tables-dpi N         text-only pages with tables render at N DPI for LayoutNet (150)\n"
     "  --no-ordernet          reading order by XY-cut instead of the OrderNet model\n"
+    "  --tables-precision P   LayoutNet engine: fp16 (default) | int8\n"
+    "  --order-precision P    OrderNet engine: fp16 (default) | int8\n"
     "  --rec budget|bucket    text-recognition batching (budget)\n"
     "\n"
     "Engine:\n"
@@ -93,6 +95,11 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--no-formula") a.engine.models.formula = a.parse.formulas = false;
     else if (k == "--no-tables") a.engine.models.tables = a.parse.tables = false;
     else if (k == "--no-ordernet") a.engine.models.ordernet = a.parse.ordernet = false;
+    else if (k == "--tables-precision" || k == "--order-precision") {
+      const std::string v = next();
+      if (v != "fp16" && v != "int8") throw std::runtime_error(k + " fp16|int8");
+      (k == "--tables-precision" ? a.engine.models.tables_precision : a.engine.models.order_precision) = v;
+    }
     else if (k == "--tables-dpi") a.parse.tables_dpi = to_int(k, next());
     else if (k == "--no-warmup") a.warmup = false;
     else if (k == "--prepare-models") a.prepare_only = true;
@@ -147,7 +154,9 @@ int main(int argc, char **argv) try {
   std::setlocale(LC_CTYPE, "C.UTF-8");
   Args a = parse_args(argc, argv);
   a.engine.models.dir = hp::prepare_models(a.engine.models.dir, {a.engine.models.ocr, a.engine.models.formula, a.engine.models.tables,
-                                                                       a.engine.models.ordernet});
+                                                                       a.engine.models.ordernet,
+                                                                       a.engine.models.tables_precision,
+                                                                       a.engine.models.order_precision});
   if (a.prepare_only) {
     std::printf("%s\n", a.engine.models.dir.c_str());
     return 0;

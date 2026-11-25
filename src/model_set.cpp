@@ -57,13 +57,15 @@ ModelSet::ModelSet(const ModelConfig &cfg) : cfg_(cfg) {
   if (cfg_.tables) {
     t = Clock::now();
     tablenet_ = std::make_unique<tn::TableNet>();
-    if (!tablenet_->load(d + "/" + kTableNetPlan)) throw std::runtime_error("LayoutNet load failed: " + d + "/" + kTableNetPlan);
+    const std::string plan = d + "/" + table_plan(cfg_.tables_precision);
+    if (!tablenet_->load(plan)) throw std::runtime_error("LayoutNet load failed: " + plan);
     load_times_.tables_ms = ms_since(t);
   }
   if (cfg_.ordernet) {
     t = Clock::now();
     ordernet_ = std::make_unique<on::OrderNet>();
-    if (!ordernet_->load(d + "/" + kOrderNetPlan)) throw std::runtime_error("OrderNet load failed: " + d + "/" + kOrderNetPlan);
+    const std::string plan = d + "/" + order_plan(cfg_.order_precision);
+    if (!ordernet_->load(plan)) throw std::runtime_error("OrderNet load failed: " + plan);
     load_times_.order_ms = ms_since(t);
   }
 }
