@@ -26,13 +26,8 @@ struct PlanSpec {
   double workspace_gb = 2.0;
 };
 
-// LayoutNet (table structure) is not in kModelRepo: it is OCRia-nano-1's tablenet.onnx, pinned
-// to a commit of its Hugging Face repo and checked against this SHA-256 (model_store.cpp).
-inline constexpr const char *kTableNetRepo = "llamaindex/OCRia-nano-1";
-inline constexpr const char *kTableNetRevision = "53d45fe6803a568deedb081550c2fdb97cc99f97";
-inline constexpr const char *kTableNetFile = "tablenet.onnx";
-inline constexpr const char *kTableNetSha256 = "3b913866067d6e43f73a4e4c9c1eace955b7959447043cc39ea1d30e4c552a95";
-inline constexpr const char *kTableNetPlan = "tablenet_3b913866.plan";
+// LayoutNet (table structure): OCRia-nano-1's tablenet.onnx, mirrored unmodified in kModelRepo.
+inline constexpr const char *kTableNetPlan = "tablenet.plan";
 
 // Every engine hp loads, in build order.
 const std::vector<PlanSpec> &plan_specs();

@@ -97,8 +97,7 @@ hyperparse_server --port 8080                 # then: curl localhost:8080/docs
 ```
 
 The models are on Hugging Face at `logxdx/hyperparse-models`, which is private
-for now. LayoutNet's `tablenet.onnx` comes from `llamaindex/OCRia-nano-1`, pinned to one commit
-and checked by SHA-256 (`src/engine_build.h`).
+for now. Its `tablenet.onnx` is OCRia-nano-1's LayoutNet, mirrored unmodified with its license.
 
 ## Layout
 
