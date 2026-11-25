@@ -33,7 +33,12 @@ nlohmann::json page_to_json(const PageResult &p, bool with_markdown) {
                       {"order", p.reading_order},
                       {"ms", {{"text", p.ms.text}, {"render", p.ms.render}, {"gpu", p.ms.gpu}}}};
   nlohmann::json tables = nlohmann::json::array();
-  for (const auto &t : p.tables) tables.push_back({{"layout", t.layout_index}, {"markdown", t.markdown}});
+  for (const auto &t : p.tables) {
+    nlohmann::json tj = {{"layout", t.layout_index}};
+    if (!t.html.empty()) tj["html"] = t.html;
+    else tj["markdown"] = t.markdown;
+    tables.push_back(std::move(tj));
+  }
   j["tables"] = tables;
   if (with_markdown) j["markdown"] = p.markdown;
   return j;

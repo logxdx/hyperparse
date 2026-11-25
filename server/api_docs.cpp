@@ -76,7 +76,8 @@ std::string api_docs(const ServerConfig &cfg, const std::string &base) {
        "     \"layout\":   [{\"cls\": \"text\", \"score\": 0.97, \"bbox\": [x0, y0, x1, y1]}, ...],\n"
        "     \"lines\":    [{\"text\": \"...\", \"bbox\": [...], \"src\": \"pdf|ocr\"}, ...],\n"
        "     \"formulas\": [{\"layout\": <index into layout>, \"latex\": \"...\"}, ...],\n"
-       "     \"tables\":   [{\"layout\": <index into layout>, \"markdown\": \"| a | b |...\"}, ...],\n"
+       "     \"tables\":   [{\"layout\": <index into layout>, \"html\": \"<table>...\"}  (LayoutNet)\n"
+       "                 | {\"layout\": ..., \"markdown\": \"| a | b |...\"} (geometry grid), ...],\n"
        "     \"order\":    [reading order of layout indices], \"markdown\": \"...\", ...}\n"
        "    A page that failed is {\"page\": i, \"error\": \"...\"}; the others still parse.\n"
        "    Example: curl --data-binary @doc.pdf '" + base + "/parse?format=markdown' > doc.md\n\n";

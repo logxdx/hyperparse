@@ -29,7 +29,14 @@ struct PageFormula {
 
 struct PageTable {
   int layout_index;      // index into the layout vector passed to assemble_page
-  std::string markdown;  // pipe table (table_grid.h)
+  std::string markdown;  // pipe table (table_grid.h), when no model table
+  std::string html;      // LayoutNet's table(s) in this region (colspan / rowspan, <th> header rows)
+};
+
+// A table LayoutNet found on the page: its box (page px) and HTML.
+struct ModelTable {
+  float x0, y0, x1, y1;
+  std::string html;
 };
 
 struct AssembledPage {
@@ -45,8 +52,11 @@ std::vector<PageLine> merge_into_lines(const std::vector<PageLine> &items);
 
 // `items` are the spans before merge_into_lines (table cells come from them);
 // `lines` are the merged lines.
+// `model_tables`: LayoutNet's tables; each goes to the Table region it overlaps most (at least
+// half of the smaller box). A Table region without one falls back to table_grid.
 AssembledPage assemble_page(int page_index, int w, int h, const std::vector<LayoutBox> &layout,
                             const std::vector<PageLine> &items, std::vector<PageLine> lines,
-                            const std::vector<PageFormula> &formulas);
+                            const std::vector<PageFormula> &formulas,
+                            const std::vector<ModelTable> &model_tables = {});
 
 }  // namespace hp

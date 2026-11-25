@@ -17,7 +17,7 @@ int main(int argc, char **argv) try {
   std::setlocale(LC_CTYPE, "C.UTF-8");
   hp::server::ServerConfig cfg = hp::server::parse_server_config(argc, argv);
   // Before the Engine: downloads/builds missing models in a child process.
-  cfg.engine.models.dir = hp::prepare_models(cfg.engine.models.dir, {cfg.engine.models.ocr, cfg.engine.models.formula});
+  cfg.engine.models.dir = hp::prepare_models(cfg.engine.models.dir, {cfg.engine.models.ocr, cfg.engine.models.formula, cfg.engine.models.tables});
 
   // First: the Engine forks its page-worker supervisor, which must happen
   // before any other thread exists (render_pool.h).

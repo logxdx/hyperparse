@@ -18,7 +18,8 @@ doesn't already have good text, and no Python on the hot path.
 - **Layout**: 12 region classes per page (text, title, table, picture, formula, caption, code, stamp, …) with reading order
 - **Text**: the PDF's own text layer when it is usable, OCR where it isn't (per page or per region)
 - **Formulas**: display formulas as LaTeX
-- **Tables**: table regions as Markdown pipe tables, built from the geometry of their text
+- **Tables**: table structure from LayoutNet (rows, columns, spanning cells, header rows) as HTML
+  inside the Markdown; `--no-tables` falls back to pipe tables built from the text's geometry
 - **Markdown**: per page and for the whole document
 - **CLI**: `hyperparse doc.pdf --md doc.md --out pages.jsonl`
 - **HTTP server**: `hyperparse_server`, with a queue, streaming (NDJSON), Prometheus metrics,
@@ -45,6 +46,7 @@ idle timeout and reload on the next request in about 0.6 s.
 | **PDFium** ([run-llama's fork](https://github.com/run-llama/pdfium-binaries)) | Robust rendering and text extraction, plus the per-glyph font data that glyph recovery needs. |
 | **D-FINE** (from [SoMark OXR-1.0](https://github.com/SoMarkAI)) | An accurate real-time layout detector: about 14 ms per page at 960² in FP16. |
 | **PP-OCRv6 small, PP-FormulaNet-S** ([PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)) | Small, fast OCR and formula models that fit next to the layout model in 6 GB. |
+| **LayoutNet** (from [OCRia-nano-1](https://huggingface.co/llamaindex/OCRia-nano-1)) | A 4.3M-parameter table-structure model over text units and the page image, run on the pages where D-FINE finds a table. Against geometry-only grids: OmniDocBench TEDS 0.480 → 0.643 (135 tables), olmOCR-bench table tests 53.4 → 68.0, at about 25 ms per table page on the assembly thread. Its features and decoder are ported from liteparse and checked against it page by page (`tests/tablenet_parity.cpp`). |
 | **[Drogon](https://github.com/drogonframework/drogon)** | A fast asynchronous C++ HTTP server. |
 
 ## Architecture
@@ -61,7 +63,7 @@ idle timeout and reload on the next request in about 0.6 s.
  GPU pipeline: TensorRT FP16, CUDA streams                           GPU
    D-FINE layout (two lanes) ──┐
    PP-OCR det ──► rec ─────────┼──► assembly: reading order (XY-cut), formulas
-   PP-FormulaNet-S ────────────┘    as LaTeX, table grids, Markdown
+   PP-FormulaNet-S ────────────┘    as LaTeX, LayoutNet tables, Markdown
     │
     ▼
  per-page results, streamed as they finish
@@ -95,7 +97,8 @@ hyperparse_server --port 8080                 # then: curl localhost:8080/docs
 ```
 
 The models are on Hugging Face at `logxdx/hyperparse-models`, which is private
-for now.
+for now. LayoutNet's `tablenet.onnx` comes from `llamaindex/OCRia-nano-1`, pinned to one commit
+and checked by SHA-256 (`src/engine_build.h`).
 
 ## Layout
 

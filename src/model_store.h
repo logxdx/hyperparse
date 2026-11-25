@@ -13,6 +13,7 @@ inline constexpr const char *kModelRepo = "logxdx/hyperparse-models";
 struct ModelNeeds {
   bool ocr = true;
   bool formula = true;
+  bool tables = true;  // LayoutNet: tablenet.onnx from kTableNetRepo (engine_build.h), any `dir` mode
 };
 
 // Returns a directory for ModelConfig::dir holding every plan and asset `needs`
@@ -25,6 +26,8 @@ struct ModelNeeds {
 //              else ~/.cache/hyperparse, under engines/<manifest hash>-sm<cc>-trt<version>.
 // Downloads and builds run in a child process, so the caller stays free of CUDA
 // and threads (Engine forks its page workers next). Throws std::runtime_error.
+// LayoutNet's ONNX is taken from `dir` when it holds tablenet.onnx, else from kTableNetRepo at
+// its pinned commit in the Hugging Face cache (downloaded when missing, SHA-256 checked).
 std::string prepare_models(const std::string &dir, ModelNeeds needs);
 
 }  // namespace hp

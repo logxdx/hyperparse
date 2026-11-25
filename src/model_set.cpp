@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <vector>
 
+#include "engine_build.h"
 #include "multi_resize.h"
 #include "core/common/cuda/cuda_check.h"
 
@@ -53,6 +54,12 @@ ModelSet::ModelSet(const ModelConfig &cfg) : cfg_(cfg) {
     if (const char *dump = std::getenv("HP_DUMP_FORMULA")) formula_->dump_dir = dump;  // debug: encoder inputs + tokens
     load_times_.formula_ms = ms_since(t);
   }
+  if (cfg_.tables) {
+    t = Clock::now();
+    tablenet_ = std::make_unique<tn::TableNet>();
+    if (!tablenet_->load(d + "/" + kTableNetPlan)) throw std::runtime_error("LayoutNet load failed: " + d + "/" + kTableNetPlan);
+    load_times_.tables_ms = ms_since(t);
+  }
 }
 
 ModelSet::~ModelSet() {
@@ -66,6 +73,7 @@ void ModelSet::synchronize() {
   for (auto &lane : lanes_) lane->stream.sync();
   CUDA_CHECK(cudaStreamSynchronize(ocr_stream_));
   CUDA_CHECK(cudaStreamSynchronize(formula_stream_));
+  CUDA_CHECK(cudaStreamSynchronize(table_stream_));
 }
 
 // Warm-up runs one synthetic page down every GPU path a real page can take, on
@@ -133,6 +141,21 @@ void ModelSet::warmup() {
     const int x0 = 120, y0 = 130, w = 560, h = 120;  // three rows of "words"
     const FormulaCrop crop{px.data() + (static_cast<size_t>(y0) * W + x0) * 3, static_cast<size_t>(W) * 3, w, h};
     (void)formula_->run({crop}, formula_stream_);
+  }
+  if (tablenet_) {
+    // A 4 x 4 grid of numbers: one forward pass at a small N (kernel loading, context setup).
+    std::vector<tn::Unit> units;
+    for (int r = 0; r < 4; ++r)
+      for (int c = 0; c < 4; ++c)
+        units.push_back(tn::ocr_unit(std::to_string(r * 4 + c), 100. + 80 * c, 100. + 20 * r, 140. + 80 * c, 112. + 20 * r));
+    const std::vector<float> feats = tn::unit_features(units, 612, 792, nullptr);
+    const std::vector<float> pairf(units.size() * units.size() * 2, 0.f);
+    tn::PageImage im;
+    im.w = 792;
+    im.h = 1024;
+    im.px.assign(static_cast<size_t>(im.w) * im.h, 255);
+    im.k = 1024.f / 792.f;
+    (void)tablenet_->forward(feats, pairf, static_cast<int>(units.size()), tn::image_input(im, units), table_stream_);
   }
   synchronize();
 }

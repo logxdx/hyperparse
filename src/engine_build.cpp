@@ -62,6 +62,16 @@ std::vector<PlanSpec> make_specs() {
                  {"ck", ckv(1), ckv(B), ckv(B)},
                  {"cv", ckv(1), ckv(B), ckv(B)}}},
                3.0});
+  // LayoutNet: FP32 (decoding thresholds logits at 0, -1.5, -4 and -8), units 2..1500 (pages with
+  // more skip the model, as the reference does). Context memory at N = 1500: ~280 MB.
+  auto units = [](int64_t n) { return std::vector<int64_t>{1, n}; };
+  s.push_back({kTableNetFile, kTableNetPlan, ModelGroup::kTables,
+               {{{"feats", {1, 2, 68}, {1, 256, 68}, {1, 1500, 68}},
+                 {"mask", units(2), units(256), units(1500)},
+                 {"pairf", {1, 2, 2, 2}, {1, 256, 256, 2}, {1, 1500, 1500, 2}},
+                 fixed("image", {1, 1, 1024, 1024}),
+                 {"boxes", {1, 2, 4}, {1, 256, 4}, {1, 1500, 4}},
+                 fixed("valid", {1, 2})}}});
   return s;
 }
 

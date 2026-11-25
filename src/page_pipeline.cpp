@@ -17,6 +17,10 @@
 #include "multi_resize.h"
 #include "ocr_stage.h"
 #include "pdf_render.h"
+#include "tablenet/features.h"
+#include "tablenet/page.h"
+#include "tablenet/text.h"
+#include "tablenet/units.h"
 #include "core/common/cuda/cuda_check.h"
 
 namespace hp {
@@ -40,7 +44,58 @@ struct PageWork {
   std::vector<PageLine> items;                // native + OCR items, before line merging
   std::vector<std::vector<uint8_t>> crop_px;  // display-formula crops (packed BGR), copied out of the slot
   std::vector<std::array<int, 3>> crop_meta;  // {layout index, w, h}
+  // LayoutNet (tables on): the worker's text-layer units, and for pages with a Table region the
+  // render in grey (copied out of the slot), for ruling lines and the image branch
+  tn::PageUnits units;
+  std::vector<uint8_t> grey;
 };
+
+bool has_table_region(const std::vector<LayoutBox> &layout) {
+  for (const auto &b : layout)
+    if (kDfineLabels[b.cls] == "Table") return true;
+  return false;
+}
+
+// LayoutNet's input for one page, in points: the text layer's units, OCR lines as units, or both
+// (partial pages: native units outside the OCR'd parts). As the reference, a page whose text is
+// under 20 characters native, or 80%+ OCR, is an OCR page.
+tn::PageInput table_input(PageWork &w) {
+  const PageResult &r = w.result;
+  const float k = r.dpi / 72.f;
+  tn::PageInput in;
+  in.w = r.width / k;
+  in.h = r.height / k;
+  std::vector<tn::Unit> ocr;
+  size_t ocr_chars = 0;
+  for (const PageLine &l : w.items) {
+    if (!l.ocr || l.inline_ocr) continue;
+    tn::Unit u = tn::ocr_unit(l.text, l.x0 / k, l.y0 / k, l.x1 / k, l.y1 / k);
+    if (u.text.empty() || u.bx[2] <= u.bx[0] || u.bx[3] <= u.bx[1]) continue;
+    ocr_chars += tn::char_count(u.text);
+    ocr.push_back(std::move(u));
+  }
+  std::vector<tn::Unit> native;
+  size_t native_chars = 0;
+  if (r.route != kFullOcr) {
+    for (tn::Unit &u : w.units.units) {
+      const float cx = static_cast<float>((u.pbox[0] + u.pbox[2]) / 2) * k, cy = static_cast<float>((u.pbox[1] + u.pbox[3]) / 2) * k;
+      bool covered = false;
+      for (const RectF &g : r.ocr_regions) covered |= cx >= g.x0 && cx <= g.x1 && cy >= g.y0 && cy <= g.y1;
+      for (const PageLine &l : w.items) covered |= l.ocr && cx >= l.x0 && cx <= l.x1 && cy >= l.y0 && cy <= l.y1;
+      if (covered) continue;
+      native_chars += tn::char_count(u.text);
+      native.push_back(std::move(u));
+    }
+  }
+  in.ocr = native_chars < 20 || ocr_chars * 5 >= (ocr_chars + native_chars) * 4;
+  in.units = in.ocr ? std::move(ocr) : std::move(native);
+  if (!in.ocr) in.units.insert(in.units.end(), std::make_move_iterator(ocr.begin()), std::make_move_iterator(ocr.end()));
+  in.grey = std::move(w.grey);
+  in.px_w = r.width;
+  in.px_h = r.height;
+  in.px_per_pt = k;
+  return in;
+}
 
 // Copy every display-formula crop out of the page slot so the slot can be reused
 // while the formulas wait for the assembly thread.
@@ -93,8 +148,8 @@ class AssemblyStage {
     if (error_) std::rethrow_exception(error_);
   }
 
-  int formulas = 0, formula_batches = 0, lines = 0;
-  double formula_ms = 0, assemble_ms = 0;
+  int formulas = 0, formula_batches = 0, lines = 0, table_pages = 0, model_table_count = 0;
+  double formula_ms = 0, assemble_ms = 0, table_ms = 0;
 
  private:
   void close() {
@@ -147,9 +202,22 @@ class AssemblyStage {
       PageResult &r = w.result;
       if (r.ok) {
         for (size_t k = 0; k < w.crop_px.size(); ++k, ++c) r.formulas.push_back({w.crop_meta[k][0], latex[c], 1.f});
+        std::vector<ModelTable> model_tables;
+        if (!w.grey.empty()) {
+          const auto tt = Clock::now();
+          const float k = r.dpi / 72.f;
+          const tn::PageInput in = table_input(w);
+          for (const tn::Table &t : tn::run_page(models_.tablenet(), in, models_.table_stream()))
+            model_tables.push_back({static_cast<float>(t.bbox[0]) * k, static_cast<float>(t.bbox[1]) * k,
+                                    static_cast<float>(t.bbox[2]) * k, static_cast<float>(t.bbox[3]) * k,
+                                    t.grid.to_html()});
+          table_ms += ms_since(tt);
+          ++table_pages;
+          model_table_count += static_cast<int>(model_tables.size());
+        }
         const auto t = Clock::now();
-        AssembledPage page =
-            assemble_page(r.page, r.width, r.height, r.layout, w.items, merge_into_lines(w.items), r.formulas);
+        AssembledPage page = assemble_page(r.page, r.width, r.height, r.layout, w.items, merge_into_lines(w.items),
+                                           r.formulas, model_tables);
         assemble_ms += ms_since(t);
         r.markdown = std::move(page.markdown);
         r.tables = std::move(page.tables);
@@ -178,6 +246,8 @@ class DocumentRun {
       : m_(m), pool_(pool), opt_(opt), sink_(sink) {
     job_opt_.ocr_dpi = opt.ocr_dpi;
     job_opt_.force = opt.ocr == OcrMode::kAll ? 1 : opt.ocr == OcrMode::kNone ? 2 : 0;
+    job_opt_.tables = opt.tables && m.has_tables();
+    job_opt_.tables_dpi = opt.tables_dpi;
   }
 
   ParseStats run(std::span<const uint8_t> pdf) {
@@ -230,6 +300,9 @@ class DocumentRun {
     stats_.formula_batches = assembly.formula_batches;
     stats_.formula_ms = assembly.formula_ms;
     stats_.assemble_ms = assembly.assemble_ms;
+    stats_.table_pages = assembly.table_pages;
+    stats_.model_tables = assembly.model_table_count;
+    stats_.table_ms = assembly.table_ms;
     stats_.lines = assembly.lines;
     stats_.formula_steps = m_.has_formula() ? m_.formula().steps_run - formula_steps0 : 0;
     stats_.wall_ms = ms_since(t_start);
@@ -286,7 +359,11 @@ class DocumentRun {
     job.busy = true;
     job.done = d;
     job.t0 = Clock::now();
-    if (!deserialize(pool_.meta(d.slot), d.meta_len, job.pt, job.rt)) throw std::runtime_error("corrupt page metadata");
+    const uint32_t text_len = d.units_off ? d.units_off : d.meta_len;
+    if (!deserialize(pool_.meta(d.slot), text_len, job.pt, job.rt)) throw std::runtime_error("corrupt page metadata");
+    if (d.units_off &&
+        !tn::deserialize(pool_.meta(d.slot) + d.units_off, d.meta_len - d.units_off, job.work.units))
+      throw std::runtime_error("corrupt page units");
     ++stats_.routes[job.rt.kind];
     stats_.text_ms += d.text_ms;
     stats_.render_ms += d.render_ms;
@@ -349,6 +426,8 @@ class DocumentRun {
     w.result.layout = lane.layout.collect();
     w.result.ok = true;
     if (opt_.formulas && m_.has_formula()) copy_formula_crops(pool_.pixels(job.done.slot), job.done.w, job.done.h, w);
+    if (job_opt_.tables && has_table_region(w.result.layout))
+      w.grey = tn::grey_from_bgr(pool_.pixels(job.done.slot), job.done.w, job.done.h, static_cast<size_t>(job.done.w) * 3);
     w.result.ms.gpu = ms_since(job.t0);
     job.busy = false;
     release_slot(job.done.slot);

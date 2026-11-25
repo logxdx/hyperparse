@@ -29,7 +29,8 @@ constexpr const char *kUsage =
     "  --det-side N           text-det max side (1280)\n"
     "  --rec budget|bucket    recognizer batching (budget)\n"
     "  --no-ocr               don't load det/rec (text layer + layout only)\n"
-    "  --no-formula           don't load the formula model\n";
+    "  --no-formula           don't load the formula model\n"
+    "  --no-tables            don't load LayoutNet (table cells from text geometry instead)\n";
 
 int to_int(const std::string &k, const std::string &v) {
   char *end = nullptr;
@@ -48,7 +49,7 @@ std::string env_name(const std::string &flag) {
 const std::vector<std::string> kValueFlags = {
     "--host",       "--port",     "--io-threads", "--max-queue", "--queue-timeout-ms", "--max-body-mb", "--max-pages",
     "--shutdown-grace", "--idle-unload", "--models", "--workers",  "--det-side",         "--rec"};
-const std::vector<std::string> kSwitches = {"--no-warmup", "--no-ocr", "--no-formula"};
+const std::vector<std::string> kSwitches = {"--no-warmup", "--no-ocr", "--no-formula", "--no-tables"};
 
 }  // namespace
 
@@ -87,6 +88,7 @@ ServerConfig parse_server_config(int argc, char **argv) {
     else if (k == "--det-side") c.engine.models.det_max_side = to_int(k, next());
     else if (k == "--no-ocr") c.engine.models.ocr = false;
     else if (k == "--no-formula") c.engine.models.formula = false;
+    else if (k == "--no-tables") c.engine.models.tables = false;
     else if (k == "--rec") {
       const std::string v = next();
       if (v != "budget" && v != "bucket") throw std::runtime_error("--rec budget|bucket");

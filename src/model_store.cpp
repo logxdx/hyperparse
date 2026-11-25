@@ -79,7 +79,8 @@ fs::path engine_cache() {
 }
 
 bool needed(ModelGroup g, ModelNeeds n) {
-  return g == ModelGroup::kLayout || (g == ModelGroup::kOcr && n.ocr) || (g == ModelGroup::kFormula && n.formula);
+  return g == ModelGroup::kLayout || (g == ModelGroup::kOcr && n.ocr) || (g == ModelGroup::kFormula && n.formula) ||
+         (g == ModelGroup::kTables && n.tables);
 }
 
 bool plans_ready(const fs::path &dir, ModelNeeds n) {
@@ -261,8 +262,8 @@ class Http {
 //   models--<org>--<name>/blobs/<etag>             file contents
 //   models--<org>--<name>/snapshots/<sha>/<path>   -> ../../blobs/<etag>
 
-fs::path repo_cache_dir() {
-  std::string name = kModelRepo;
+fs::path repo_cache_dir(const std::string &repo = kModelRepo) {
+  std::string name = repo;
   for (size_t p; (p = name.find('/')) != std::string::npos;) name.replace(p, 1, "--");
   return hf_hub_cache() / ("models--" + name);
 }
@@ -354,6 +355,53 @@ fs::path download_snapshot(const fs::path &repo, const std::string &rev) {
   return snap;
 }
 
+// One file of a public repo at a fixed commit, in the Hugging Face cache layout, verified by
+// SHA-256 (LayoutNet's ONNX). Returns its snapshot directory.
+fs::path fetch_pinned(const std::string &repo_id, const std::string &sha, const std::string &file,
+                      const std::string &sha256) {
+  const fs::path repo = repo_cache_dir(repo_id);
+  const fs::path snap = repo / "snapshots" / sha;
+  if (fs::exists(snap / file)) {
+    if (sha256_file(snap / file) != sha256) throw std::runtime_error((snap / file).string() + ": SHA-256 mismatch");
+    return snap;
+  }
+  if (env("HF_HUB_OFFLINE") == "1")
+    throw std::runtime_error(repo_id + "/" + file + " is not in " + hf_hub_cache().string() + " and HF_HUB_OFFLINE=1");
+  Http http(hf_token());
+  const std::string url = "https://huggingface.co/" + repo_id + "/resolve/" + sha + "/" + file;
+  Http::Reply h = http.fetch(url, true, false);
+  if (h.status >= 400) throw std::runtime_error(repo_id + "/" + file + ": HTTP " + std::to_string(h.status));
+  std::string etag = normalize_etag(h.headers.count("x-linked-etag") ? h.headers["x-linked-etag"] : h.headers["etag"]);
+  if (etag.empty() || etag.find('/') != std::string::npos) throw std::runtime_error(file + ": no usable ETag");
+  const fs::path blob = repo / "blobs" / etag;
+  if (!fs::exists(blob)) {
+    fs::create_directories(blob.parent_path());
+    std::fprintf(stderr, "downloading %s/%s@%.12s into %s\n", repo_id.c_str(), file.c_str(), sha.c_str(), repo.c_str());
+    const fs::path tmp = blob.string() + ".incomplete";
+    std::FILE *out = std::fopen(tmp.c_str(), "wb");
+    if (!out) throw std::runtime_error("cannot write " + tmp.string());
+    const Http::Reply r = http.fetch(url, false, true, out);
+    if (std::fclose(out) != 0 || r.status != 200) {
+      fs::remove(tmp);
+      throw std::runtime_error(file + ": download failed (HTTP " + std::to_string(r.status) + ")");
+    }
+    if (sha256_file(tmp) != sha256) {
+      fs::remove(tmp);
+      throw std::runtime_error(repo_id + "/" + file + ": SHA-256 does not match the pinned model");
+    }
+    fs::rename(tmp, blob);
+  }
+  fs::create_directories(snap);
+  fs::create_symlink("../../blobs/" + etag, snap / file);
+  return snap;
+}
+
+// Where a plan's ONNX lives: LayoutNet from `onnx_dir` if it holds it, else the pinned download.
+fs::path onnx_source(const PlanSpec &s, const fs::path &onnx_dir) {
+  if (s.group != ModelGroup::kTables || fs::exists(onnx_dir / s.onnx)) return onnx_dir;
+  return fetch_pinned(kTableNetRepo, kTableNetRevision, kTableNetFile, kTableNetSha256);
+}
+
 // ---- engines -------------------------------------------------------------
 
 // Builds the missing plans of `needs` from onnx_dir into plan_dir and copies the
@@ -376,7 +424,7 @@ void ensure_engines(const fs::path &onnx_dir, const fs::path &plan_dir, ModelNee
   for (size_t i = 0; i < todo.size(); ++i) {
     std::fprintf(stderr, "  [%zu/%zu] %s ...", i + 1, todo.size(), todo[i]->plan.c_str());
     const auto t = std::chrono::steady_clock::now();
-    build_plan(*todo[i], onnx_dir.string(), plan_dir.string());
+    build_plan(*todo[i], onnx_source(*todo[i], onnx_dir).string(), plan_dir.string());
     std::fprintf(stderr, " %.0f s\n",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count());
   }

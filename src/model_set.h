@@ -19,6 +19,7 @@
 #include "formula.h"
 #include "text_det.h"
 #include "text_recognizer.h"
+#include "tablenet/tablenet.h"
 #include "core/common/cuda/cuda_ptr.h"
 
 namespace hp {
@@ -34,6 +35,7 @@ struct ModelConfig {
   int det_max_side = 1280;
   bool ocr = true;               // load det + rec; without them, pages without a text layer get layout only
   bool formula = true;           // load PP-FormulaNet-S
+  bool tables = true;            // load LayoutNet (table structure in Table layout regions)
   RecMode rec = RecMode::kColumnBudget;
 };
 
@@ -45,6 +47,7 @@ struct ModelLoadTimes {
   double det_ms = 0;
   double rec_ms = 0;
   double formula_ms = 0;  // encoder + prep + decode step
+  double tables_ms = 0;   // LayoutNet
 };
 
 // One layout lane: a D-FINE context, the page buffer it reads, and its stream.
@@ -82,6 +85,9 @@ class ModelSet {
   [[nodiscard]] LayoutLane &lane(int i) { return *lanes_[i]; }
   [[nodiscard]] bool has_ocr() const { return det_ != nullptr; }
   [[nodiscard]] bool has_formula() const { return formula_ != nullptr; }
+  [[nodiscard]] bool has_tables() const { return tablenet_ != nullptr; }
+  [[nodiscard]] tn::TableNet &tablenet() { return *tablenet_; }
+  [[nodiscard]] cudaStream_t table_stream() const { return table_stream_; }
   [[nodiscard]] TextDet &det() { return *det_; }
   [[nodiscard]] CropBatch &det_crops() { return det_crops_; }
   [[nodiscard]] TextRecognizer &rec() { return *rec_; }
@@ -94,12 +100,13 @@ class ModelSet {
   ModelLoadTimes load_times_;
   // Streams first: members are destroyed in reverse order, so the streams outlive
   // every engine and buffer that may still have work queued on them.
-  CudaStream ocr_stream_, formula_stream_;
+  CudaStream ocr_stream_, formula_stream_, table_stream_;
   std::array<std::unique_ptr<LayoutLane>, kLanes> lanes_;
   std::unique_ptr<TextDet> det_;
   CropBatch det_crops_;
   std::unique_ptr<TextRecognizer> rec_;
   std::unique_ptr<FormulaRecognizer> formula_;
+  std::unique_ptr<tn::TableNet> tablenet_;
 };
 
 }  // namespace hp

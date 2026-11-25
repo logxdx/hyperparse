@@ -84,7 +84,7 @@ std::vector<PageLine> merge_into_lines(const std::vector<PageLine> &in) {
 
 AssembledPage assemble_page(int page_index, int w, int h, const std::vector<LayoutBox> &layout_in,
                             const std::vector<PageLine> &items, std::vector<PageLine> lines,
-                            const std::vector<PageFormula> &formulas) {
+                            const std::vector<PageFormula> &formulas, const std::vector<ModelTable> &model_tables) {
   AssembledPage page;
   // ── layout in the PP vocabulary ──
   struct L { LayoutBox b; int cls; int src; };
@@ -159,20 +159,45 @@ AssembledPage assemble_page(int page_index, int w, int h, const std::vector<Layo
     r.box = res.layout[r.layout_id].box;
     res.formulas.push_back(std::move(r));
   }
-  // Tables: a grid from the spans inside each Table region (table_grid.h).
+  // Tables. LayoutNet's tables go to the Table region each overlaps most (at least half of the
+  // smaller box; D-FINE decides where tables are, the model their structure), in reading order
+  // when a region holds several. Other Table regions get a grid from their spans (table_grid.h).
+  std::vector<std::vector<const ModelTable *>> by_region(layout_in.size());
+  for (const ModelTable &mt : model_tables) {
+    int best = -1;
+    float best_ov = 0;
+    for (size_t i = 0; i < layout_in.size(); ++i) {
+      if (kDfineLabels[layout_in[i].cls] != "Table" || src_to_new[i] < 0) continue;
+      const LayoutBox &b = layout_in[i];
+      const float ix = std::min(mt.x1, b.x1) - std::max(mt.x0, b.x0), iy = std::min(mt.y1, b.y1) - std::max(mt.y0, b.y0);
+      if (ix <= 0 || iy <= 0) continue;
+      const float small = std::min((mt.x1 - mt.x0) * (mt.y1 - mt.y0), (b.x1 - b.x0) * (b.y1 - b.y0));
+      const float ov = ix * iy / std::max(small, 1.f);
+      if (ov > best_ov) best_ov = ov, best = static_cast<int>(i);
+    }
+    if (best >= 0 && best_ov >= 0.5f) by_region[best].push_back(&mt);
+  }
   for (size_t i = 0; i < layout_in.size(); ++i) {
     if (kDfineLabels[layout_in[i].cls] != "Table" || src_to_new[i] < 0) continue;
-    std::vector<PageLine> spans;
-    for (const auto &it : items)
-      if (center_in(it, layout_in[i])) spans.push_back(it);
-    std::string md = table_markdown(std::move(spans));
-    if (md.empty()) continue;
     hp::core::router::TableResult t;
     t.layout_id = src_to_new[i];
-    t.markdown = md;
     t.box = res.layout[t.layout_id].box;
+    PageTable pt{static_cast<int>(i), {}, {}};
+    if (!by_region[i].empty()) {
+      auto &v = by_region[i];
+      std::stable_sort(v.begin(), v.end(), [](const ModelTable *a, const ModelTable *b) { return a->y0 < b->y0; });
+      for (const ModelTable *mt : v) pt.html += (pt.html.empty() ? "" : "\n") + mt->html;
+      t.html = pt.html;
+    } else {
+      std::vector<PageLine> spans;
+      for (const auto &it : items)
+        if (center_in(it, layout_in[i])) spans.push_back(it);
+      pt.markdown = table_markdown(std::move(spans));
+      if (pt.markdown.empty()) continue;
+      t.markdown = pt.markdown;
+    }
     res.tables.push_back(std::move(t));
-    page.tables.push_back({static_cast<int>(i), std::move(md)});
+    page.tables.push_back(std::move(pt));
   }
   hp::core::pipeline::maybe_assign_reading_order(true, res.results, res.layout, res.reading_order);
   page.markdown = hp::core::markdown::render_markdown(res);

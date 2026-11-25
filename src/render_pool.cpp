@@ -24,13 +24,14 @@
 
 #include "pdf_render.h"
 #include "text_layer.h"
+#include "tablenet/units.h"
 
 namespace hp {
 
 struct RenderPool::Job {
   int32_t page, slot;
   uint32_t gen;
-  int32_t ocr_dpi, force;
+  int32_t ocr_dpi, force, tables, tables_dpi;
   uint64_t doc_len;
 };
 
@@ -187,7 +188,7 @@ uint32_t RenderPool::set_document(std::span<const uint8_t> pdf) {
 }
 
 void RenderPool::submit(int page, int slot, uint32_t gen, const PageJobOptions &o) {
-  const Job j{page, slot, gen, o.ocr_dpi, o.force, doc_len_};
+  const Job j{page, slot, gen, o.ocr_dpi, o.force, o.tables ? 1 : 0, o.tables_dpi, doc_len_};
   SigpipeBlocker no_sigpipe;
   if (!write_full(job_w_, &j, sizeof j)) throw std::runtime_error("RenderPool: job pipe closed (supervisor died)");
 }
@@ -364,6 +365,9 @@ void RenderPool::worker_main(int index) {
     Done d{j.page, j.slot, 0, 0, kRenderFailed, kNative, j.gen, 0, 0.f, 0.f, 0.f};
     if (raster && raster->ok()) {
       auto t = Clock::now();
+      // LayoutNet units first: PDFium reports character boxes differently after extraction.
+      tn::PageUnits units;
+      if (j.tables) units = tn::native_units_doc(raster->doc(), j.page);
       PageText pt = extract_page_text(raster->doc(), j.page);
       Route rt = route_page(pt);
       if (j.force == 1 && rt.kind != kFullOcr) { rt.kind = kFullOcr; rt.reasons = 0; }
@@ -376,6 +380,8 @@ void RenderPool::worker_main(int index) {
       const float long_pt = std::max(std::max(pt.w_pt, pt.h_pt), 1.f);
       float dpi = rt.kind == kNative ? std::min<float>(j.ocr_dpi, opt_.canvas * 72.f / long_pt)
                                      : std::min<float>(j.ocr_dpi, opt_.ocr_max_side * 72.f / long_pt);
+      if (j.tables && rt.kind == kNative && j.tables_dpi > 0)
+        dpi = std::max(dpi, std::min<float>(j.tables_dpi, opt_.ocr_max_side * 72.f / long_pt));
       int w = 0, h = 0;
       raster->page_size_px(j.page, dpi, w, h);
       if (static_cast<size_t>(w) * h * 3 > opt_.pixel_bytes) {
@@ -383,6 +389,10 @@ void RenderPool::worker_main(int index) {
         raster->page_size_px(j.page, dpi, w, h);
       }
       serialize(pt, rt, meta);
+      if (j.tables) {
+        d.units_off = static_cast<uint32_t>(meta.size());
+        tn::serialize(units, meta);
+      }
       t = Clock::now();
       uint8_t *slot = pixels(j.slot);
       const bool ok = meta.size() <= opt_.meta_bytes && raster->render_bgr(j.page, slot, w, h);

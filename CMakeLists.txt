@@ -135,6 +135,12 @@ add_library(hp_core STATIC
   src/text_layer.cpp
   src/assemble.cpp
   src/table_grid.cpp
+  src/tablenet/text.cpp
+  src/tablenet/decode.cpp
+  src/tablenet/units.cpp
+  src/tablenet/features.cpp
+  src/tablenet/tablenet.cpp
+  src/tablenet/page.cpp
   src/glyph_decoder.cpp
   src/formula.cu
   src/rec_batcher.cpp
@@ -147,6 +153,10 @@ add_library(hp_core STATIC
   src/model_store.cpp
   src/engine.cpp)
 target_include_directories(hp_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
+# LayoutNet's features and decoder must round like the Rust reference (tests/tablenet_parity):
+# no fused multiply-adds.
+set_source_files_properties(src/tablenet/text.cpp src/tablenet/decode.cpp src/tablenet/units.cpp
+  src/tablenet/features.cpp src/tablenet/page.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 target_include_directories(hp_core SYSTEM PUBLIC ${TRT_INCLUDE_DIR} ${PDFIUM_DIR}/include ${JSON_INCLUDE_DIR})
 target_include_directories(hp_core SYSTEM PRIVATE ${CURL_INCLUDE_DIRS})
 target_link_libraries(hp_core PUBLIC CUDA::cudart_static ${NVINFER} ${NVONNXPARSER} ${PDFIUM_DIR}/lib/libpdfium.so ${CMAKE_DL_LIBS})
@@ -175,6 +185,16 @@ set_target_properties(formula_golden_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR}
 add_executable(render_pool_test tests/render_pool_test.cpp)
 target_link_libraries(render_pool_test PRIVATE hp_core)
 set_target_properties(render_pool_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
+add_executable(tablenet_decode_test tests/tablenet_decode_test.cpp)
+target_link_libraries(tablenet_decode_test PRIVATE hp_core)
+target_compile_options(tablenet_decode_test PRIVATE -O2 -Wall -Wextra)
+set_target_properties(tablenet_decode_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
+add_executable(tablenet_parity tests/tablenet_parity.cpp)
+target_link_libraries(tablenet_parity PRIVATE hp_core)
+target_compile_options(tablenet_parity PRIVATE -O2 -Wall -Wextra)
+set_target_properties(tablenet_parity PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
 add_executable(engine_lifecycle_test tests/engine_lifecycle_test.cpp)
 target_link_libraries(engine_lifecycle_test PRIVATE hp_core)

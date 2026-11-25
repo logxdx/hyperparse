@@ -23,6 +23,13 @@ struct ParseOptions {
   int ocr_dpi = 150;  // render DPI for pages that need OCR (capped at a 2200 px long side)
   OcrMode ocr = OcrMode::kAuto;
   bool formulas = true;  // recognise display formulas (if the engine loaded the model)
+  // Table structure from LayoutNet in D-FINE Table regions (if the engine loaded it); otherwise,
+  // or where the model finds no table, cells come from span geometry (table_grid.h).
+  bool tables = true;
+  // With tables, text-only pages render at least this DPI: LayoutNet's ruling lines and image
+  // branch were trained on 150 DPI renders (text-only pages otherwise render just large enough
+  // for the 960 px layout canvas, ~80 DPI for A4). 0 keeps the small render.
+  int tables_dpi = 150;
   // Reject documents with more pages than this (PageLimitError) before any page
   // is rendered. 0 = no limit.
   int max_pages = 0;
@@ -94,6 +101,9 @@ struct ParseStats {
 
   int formulas = 0, formula_batches = 0, formula_steps = 0;
   double formula_ms = 0;
+
+  int table_pages = 0, model_tables = 0;  // pages LayoutNet ran on, tables it returned
+  double table_ms = 0;                    // LayoutNet on the assembly thread (features, net, decode)
 };
 
 }  // namespace hp

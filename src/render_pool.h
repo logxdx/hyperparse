@@ -46,6 +46,8 @@ namespace hp {
 struct PageJobOptions {
   int ocr_dpi = 150;  // render DPI for pages with OCR work
   int force = 0;      // 0 = route each page, 1 = OCR every page, 2 = never OCR
+  bool tables = false;  // build LayoutNet text units (tablenet/units.h) after the page meta
+  int tables_dpi = 0;   // with tables: text-only pages render at least this DPI (LayoutNet's rules / image)
 };
 
 class RenderPool {
@@ -67,6 +69,7 @@ class RenderPool {
     uint32_t gen;  // document generation the job belonged to
     uint32_t meta_len;
     float dpi, text_ms, render_ms;
+    uint32_t units_off = 0;  // tables: LayoutNet units start here in the meta (0 = none)
   };
 
   explicit RenderPool(const Options &opt);
