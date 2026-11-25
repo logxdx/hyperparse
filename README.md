@@ -15,7 +15,9 @@ doesn't already have good text, and no Python on the hot path.
 
 ## What you get
 
-- **Layout**: 12 region classes per page (text, title, table, picture, formula, caption, code, stamp, …) with reading order
+- **Layout**: 12 region classes per page (text, title, table, picture, formula, caption, code, stamp, …)
+- **Reading order**: OrderNet orders the page's lines and groups them into blocks (paragraphs,
+  headings, lists), around D-FINE's tables and formulas; `--no-ordernet` falls back to XY-cut
 - **Text**: the PDF's own text layer when it is usable, OCR where it isn't (per page or per region)
 - **Formulas**: display formulas as LaTeX
 - **Tables**: table structure from LayoutNet (rows, columns, spanning cells, header rows) as HTML
@@ -46,6 +48,7 @@ idle timeout and reload on the next request in about 0.6 s.
 | **PDFium** ([run-llama's fork](https://github.com/run-llama/pdfium-binaries)) | Robust rendering and text extraction, plus the per-glyph font data that glyph recovery needs. |
 | **D-FINE** (from [SoMark OXR-1.0](https://github.com/SoMarkAI)) | An accurate real-time layout detector: about 14 ms per page at 960² in FP16. |
 | **PP-OCRv6 small, PP-FormulaNet-S** ([PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)) | Small, fast OCR and formula models that fit next to the layout model in 6 GB. |
+| **OrderNet** (from [Indra OCR](https://huggingface.co/datalab-to/indra-ocr)) | A 0.73M-parameter reading-order model over text lines: pairwise order, block classes and same-block links. Against XY-cut: olmOCR-bench 52.1 → 54.1 (order tests 43.5 → 52.2, multi-column 60 → 72), OmniDocBench reading-order Kendall tau 0.88 → 0.95. Its decoding and Markdown rendering are ported from indra_ocr and checked against it (`tests/ordernet_parity_test.cpp`). |
 | **LayoutNet** (from [OCRia-nano-1](https://huggingface.co/llamaindex/OCRia-nano-1)) | A 4.3M-parameter table-structure model over text units and the page image, run on the pages where D-FINE finds a table. Against geometry-only grids: OmniDocBench TEDS 0.480 → 0.643 (135 tables), olmOCR-bench table tests 53.4 → 68.0, at about 25 ms per table page on the assembly thread. Its features and decoder are ported from liteparse and checked against it page by page (`tests/tablenet_parity.cpp`). |
 | **[Drogon](https://github.com/drogonframework/drogon)** | A fast asynchronous C++ HTTP server. |
 
@@ -63,7 +66,7 @@ idle timeout and reload on the next request in about 0.6 s.
  GPU pipeline: TensorRT FP16, CUDA streams                           GPU
    D-FINE layout (two lanes) ──┐
    PP-OCR det ──► rec ─────────┼──► assembly: reading order (XY-cut), formulas
-   PP-FormulaNet-S ────────────┘    as LaTeX, LayoutNet tables, Markdown
+   PP-FormulaNet-S ────────────┘    as LaTeX, LayoutNet tables, OrderNet order + blocks, Markdown
     │
     ▼
  per-page results, streamed as they finish

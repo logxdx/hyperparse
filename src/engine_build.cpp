@@ -72,6 +72,9 @@ std::vector<PlanSpec> make_specs() {
                  fixed("image", {1, 1, 1024, 1024}),
                  {"boxes", {1, 2, 4}, {1, 256, 4}, {1, 1500, 4}},
                  fixed("valid", {1, 2})}}});
+  // OrderNet: FP32, lines 2..2048 (longer pages keep XY-cut). Context memory at 2048: ~210 MB.
+  s.push_back({"order.onnx", kOrderNetPlan, ModelGroup::kOrder,
+               {{{"feats", {1, 2, 16}, {1, 256, 16}, {1, 2048, 16}}, {"mask", {1, 2}, {1, 256}, {1, 2048}}}}});
   return s;
 }
 

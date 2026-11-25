@@ -16,7 +16,7 @@ struct InputRange {
 };
 using Profile = std::vector<InputRange>;
 
-enum class ModelGroup { kLayout, kOcr, kFormula, kTables };
+enum class ModelGroup { kLayout, kOcr, kFormula, kTables, kOrder };
 
 struct PlanSpec {
   std::string onnx;  // relative to the ONNX dir
@@ -28,6 +28,8 @@ struct PlanSpec {
 
 // LayoutNet (table structure): OCRia-nano-1's tablenet.onnx, mirrored unmodified in kModelRepo.
 inline constexpr const char *kTableNetPlan = "tablenet.plan";
+// OrderNet (reading order and block structure): Indra OCR's order.onnx, mirrored in kModelRepo.
+inline constexpr const char *kOrderNetPlan = "order.plan";
 
 // Every engine hp loads, in build order.
 const std::vector<PlanSpec> &plan_specs();

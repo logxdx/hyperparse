@@ -19,6 +19,7 @@
 #include "formula.h"
 #include "text_det.h"
 #include "text_recognizer.h"
+#include "ordernet/net.h"
 #include "tablenet/tablenet.h"
 #include "core/common/cuda/cuda_ptr.h"
 
@@ -36,6 +37,7 @@ struct ModelConfig {
   bool ocr = true;               // load det + rec; without them, pages without a text layer get layout only
   bool formula = true;           // load PP-FormulaNet-S
   bool tables = true;            // load LayoutNet (table structure in Table layout regions)
+  bool ordernet = true;          // load OrderNet (reading order and block structure)
   RecMode rec = RecMode::kColumnBudget;
 };
 
@@ -48,6 +50,7 @@ struct ModelLoadTimes {
   double rec_ms = 0;
   double formula_ms = 0;  // encoder + prep + decode step
   double tables_ms = 0;   // LayoutNet
+  double order_ms = 0;    // OrderNet
 };
 
 // One layout lane: a D-FINE context, the page buffer it reads, and its stream.
@@ -88,6 +91,8 @@ class ModelSet {
   [[nodiscard]] bool has_tables() const { return tablenet_ != nullptr; }
   [[nodiscard]] tn::TableNet &tablenet() { return *tablenet_; }
   [[nodiscard]] cudaStream_t table_stream() const { return table_stream_; }
+  [[nodiscard]] bool has_ordernet() const { return ordernet_ != nullptr; }
+  [[nodiscard]] on::OrderNet &ordernet() { return *ordernet_; }
   [[nodiscard]] TextDet &det() { return *det_; }
   [[nodiscard]] CropBatch &det_crops() { return det_crops_; }
   [[nodiscard]] TextRecognizer &rec() { return *rec_; }
@@ -107,6 +112,7 @@ class ModelSet {
   std::unique_ptr<TextRecognizer> rec_;
   std::unique_ptr<FormulaRecognizer> formula_;
   std::unique_ptr<tn::TableNet> tablenet_;
+  std::unique_ptr<on::OrderNet> ordernet_;
 };
 
 }  // namespace hp

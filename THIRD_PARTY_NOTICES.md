@@ -3,6 +3,7 @@
 | Component | Where | License |
 |---|---|---|
 | [liteparse](https://github.com/run-llama/liteparse) | Text-layer routing, glyph recovery and the AGL table, ported to C++ in `src/text_layer.cpp`, `src/glyph_decoder.cpp`, `src/agl_table.h`; LayoutNet's text units, features and table decoding (`table_model/`), ported in `src/tablenet/` | Apache-2.0 |
+| [indra_ocr](https://github.com/datalab-to/indra) | OrderNet's line features, block-order decoding and block Markdown (`order_post.py`, `layout_post.py`), ported in `src/ordernet/` | Apache-2.0 |
 | [nlohmann/json](https://github.com/nlohmann/json) | fetched into `build/_deps` | MIT |
 | [PDFium](https://pdfium.googlesource.com/pdfium/) (run-llama fork) | fetched into `build/_deps` | BSD-3-Clause, installed to `dist/share/licenses/pdfium` |
 | [Drogon](https://github.com/drogonframework/drogon), [jsoncpp](https://github.com/open-source-parsers/jsoncpp) | built into `build/_deps` by `tools/build_drogon.sh` | MIT |

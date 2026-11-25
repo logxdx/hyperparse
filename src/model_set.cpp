@@ -60,6 +60,12 @@ ModelSet::ModelSet(const ModelConfig &cfg) : cfg_(cfg) {
     if (!tablenet_->load(d + "/" + kTableNetPlan)) throw std::runtime_error("LayoutNet load failed: " + d + "/" + kTableNetPlan);
     load_times_.tables_ms = ms_since(t);
   }
+  if (cfg_.ordernet) {
+    t = Clock::now();
+    ordernet_ = std::make_unique<on::OrderNet>();
+    if (!ordernet_->load(d + "/" + kOrderNetPlan)) throw std::runtime_error("OrderNet load failed: " + d + "/" + kOrderNetPlan);
+    load_times_.order_ms = ms_since(t);
+  }
 }
 
 ModelSet::~ModelSet() {
@@ -156,6 +162,14 @@ void ModelSet::warmup() {
     im.px.assign(static_cast<size_t>(im.w) * im.h, 255);
     im.k = 1024.f / 792.f;
     (void)tablenet_->forward(feats, pairf, static_cast<int>(units.size()), tn::image_input(im, units), table_stream_);
+  }
+  if (ordernet_) {
+    // Two columns of four lines: one forward pass at a small N (runs on the assembly thread's stream).
+    std::vector<on::Line> lines;
+    for (int c = 0; c < 2; ++c)
+      for (int r = 0; r < 4; ++r)
+        lines.push_back({{100.f + 500 * c, 100.f + 30 * r, 500.f + 500 * c, 120.f + 30 * r}, "Some words on a line."});
+    (void)ordernet_->forward(on::line_features(lines, 1275, 1650), static_cast<int>(lines.size()), table_stream_);
   }
   synchronize();
 }

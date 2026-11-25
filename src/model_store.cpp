@@ -80,7 +80,7 @@ fs::path engine_cache() {
 
 bool needed(ModelGroup g, ModelNeeds n) {
   return g == ModelGroup::kLayout || (g == ModelGroup::kOcr && n.ocr) || (g == ModelGroup::kFormula && n.formula) ||
-         (g == ModelGroup::kTables && n.tables);
+         (g == ModelGroup::kTables && n.tables) || (g == ModelGroup::kOrder && n.ordernet);
 }
 
 bool plans_ready(const fs::path &dir, ModelNeeds n) {
@@ -376,6 +376,59 @@ fs::path download_snapshot(const fs::path &repo, const std::string &rev) {
 
 // Builds the missing plans of `needs` from onnx_dir into plan_dir and copies the
 // assets across. A lock file serialises concurrent hp processes.
+// What a plan was built from: its ONNX (SHA-256, from the manifest when there is one) and its
+// optimization profiles. Stored next to the plan as <plan>.src.
+std::string plan_source_key(const PlanSpec &s, const fs::path &onnx_dir) {
+  std::string sha;
+  const json m = read_manifest(onnx_dir);
+  if (m.is_object() && m.contains("files"))
+    for (const json &f : m["files"])
+      if (f.at("path") == s.onnx) sha = f.at("sha256").get<std::string>();
+  if (sha.empty() && fs::exists(onnx_dir / s.onnx)) sha = sha256_file(onnx_dir / s.onnx);
+  std::string key = sha + " ws=" + std::to_string(s.workspace_gb);
+  for (const Profile &p : s.profiles) {
+    key += " |";
+    for (const InputRange &r : p) {
+      key += " " + r.name;
+      for (const auto *v : {&r.min, &r.opt, &r.max}) {
+        key += ":";
+        for (int64_t d : *v) key += std::to_string(d) + "x";
+      }
+    }
+  }
+  return key;
+}
+
+std::string read_text(const fs::path &p) {
+  std::ifstream in(p);
+  return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+}
+
+// A plan built from the same ONNX and profiles for this GPU and TensorRT in another engine-cache
+// folder (the cache is keyed by the whole manifest, so adding one model to the repo starts a new
+// folder): copy it instead of rebuilding.
+bool reuse_plan(const PlanSpec &s, const fs::path &plan_dir, const std::string &key) {
+  const std::string name = plan_dir.filename().string();
+  const size_t dash = name.find('-');
+  if (dash == std::string::npos || !fs::is_directory(plan_dir.parent_path())) return false;
+  const std::string suffix = name.substr(dash);  // -sm<cc>-trt<version>
+  for (const auto &e : fs::directory_iterator(plan_dir.parent_path())) {
+    const std::string other = e.path().filename().string();
+    if (e.path() == plan_dir || other.size() <= suffix.size() ||
+        other.compare(other.size() - suffix.size(), suffix.size(), suffix) != 0)
+      continue;
+    const fs::path src = e.path() / s.plan;
+    if (!fs::exists(src) || read_text(src.string() + ".src") != key) continue;
+    fs::create_directories((plan_dir / s.plan).parent_path());
+    const fs::path tmp = (plan_dir / s.plan).string() + ".tmp" + std::to_string(::getpid());
+    fs::copy_file(src, tmp, fs::copy_options::overwrite_existing);
+    fs::rename(tmp, plan_dir / s.plan);
+    std::ofstream(plan_dir / (s.plan + ".src")) << key;
+    return true;
+  }
+  return false;
+}
+
 void ensure_engines(const fs::path &onnx_dir, const fs::path &plan_dir, ModelNeeds needs) {
   fs::create_directories(plan_dir);
   const fs::path lock_path = plan_dir / ".build.lock";
@@ -389,12 +442,18 @@ void ensure_engines(const fs::path &onnx_dir, const fs::path &plan_dir, ModelNee
   for (const PlanSpec &s : plan_specs())
     if (needed(s.group, needs) && !fs::exists(plan_dir / s.plan)) todo.push_back(&s);
   if (!todo.empty())
-    std::fprintf(stderr, "building %zu TensorRT engine(s) with TensorRT %s into %s (one-time; minutes)\n", todo.size(),
+    std::fprintf(stderr, "preparing %zu TensorRT engine(s) with TensorRT %s in %s (one-time; minutes)\n", todo.size(),
                  trt_version().c_str(), plan_dir.c_str());
   for (size_t i = 0; i < todo.size(); ++i) {
     std::fprintf(stderr, "  [%zu/%zu] %s ...", i + 1, todo.size(), todo[i]->plan.c_str());
+    const std::string key = plan_source_key(*todo[i], onnx_dir);
+    if (reuse_plan(*todo[i], plan_dir, key)) {
+      std::fprintf(stderr, " unchanged, copied from another engine cache\n");
+      continue;
+    }
     const auto t = std::chrono::steady_clock::now();
     build_plan(*todo[i], onnx_dir.string(), plan_dir.string());
+    std::ofstream(plan_dir / (todo[i]->plan + ".src")) << key;
     std::fprintf(stderr, " %.0f s\n",
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t).count());
   }

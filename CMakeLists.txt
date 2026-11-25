@@ -141,6 +141,10 @@ add_library(hp_core STATIC
   src/tablenet/features.cpp
   src/tablenet/tablenet.cpp
   src/tablenet/page.cpp
+  src/ordernet/order.cpp
+  src/ordernet/text.cpp
+  src/ordernet/net.cpp
+  src/ordernet/page.cpp
   src/glyph_decoder.cpp
   src/formula.cu
   src/rec_batcher.cpp
@@ -156,7 +160,8 @@ target_include_directories(hp_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 # LayoutNet's features and decoder must round like the Rust reference (tests/tablenet_parity):
 # no fused multiply-adds.
 set_source_files_properties(src/tablenet/text.cpp src/tablenet/decode.cpp src/tablenet/units.cpp
-  src/tablenet/features.cpp src/tablenet/page.cpp PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+  src/tablenet/features.cpp src/tablenet/page.cpp src/ordernet/order.cpp src/ordernet/text.cpp
+  PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 target_include_directories(hp_core SYSTEM PUBLIC ${TRT_INCLUDE_DIR} ${PDFIUM_DIR}/include ${JSON_INCLUDE_DIR})
 target_include_directories(hp_core SYSTEM PRIVATE ${CURL_INCLUDE_DIRS})
 target_link_libraries(hp_core PUBLIC CUDA::cudart_static ${NVINFER} ${NVONNXPARSER} ${PDFIUM_DIR}/lib/libpdfium.so ${CMAKE_DL_LIBS})
@@ -190,6 +195,15 @@ add_executable(tablenet_decode_test tests/tablenet_decode_test.cpp)
 target_link_libraries(tablenet_decode_test PRIVATE hp_core)
 target_compile_options(tablenet_decode_test PRIVATE -O2 -Wall -Wextra)
 set_target_properties(tablenet_decode_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
+add_executable(ordernet_parity_test tests/ordernet_parity_test.cpp)
+target_link_libraries(ordernet_parity_test PRIVATE hp_core)
+target_compile_options(ordernet_parity_test PRIVATE -O2 -Wall -Wextra)
+set_target_properties(ordernet_parity_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
+add_executable(ordernet_trt_check tests/ordernet_trt_check.cpp)
+target_link_libraries(ordernet_trt_check PRIVATE hp_core)
+set_target_properties(ordernet_trt_check PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
 add_executable(tablenet_parity tests/tablenet_parity.cpp)
 target_link_libraries(tablenet_parity PRIVATE hp_core)

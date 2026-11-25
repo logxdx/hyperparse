@@ -122,7 +122,8 @@ void copy_formula_crops(const uint8_t *page, int w, int h, PageWork &pw) {
 // only after join().
 class AssemblyStage {
  public:
-  AssemblyStage(ModelSet &models, const PageSink &sink) : models_(models), sink_(sink), thread_([this] { loop(); }) {}
+  AssemblyStage(ModelSet &models, const PageSink &sink, bool ordernet)
+      : models_(models), sink_(sink), ordernet_(ordernet && models.has_ordernet()), thread_([this] { loop(); }) {}
   ~AssemblyStage() { close(); }
 
   void push(PageWork &&w) {
@@ -148,8 +149,8 @@ class AssemblyStage {
     if (error_) std::rethrow_exception(error_);
   }
 
-  int formulas = 0, formula_batches = 0, lines = 0, table_pages = 0, model_table_count = 0;
-  double formula_ms = 0, assemble_ms = 0, table_ms = 0;
+  int formulas = 0, formula_batches = 0, lines = 0, table_pages = 0, model_table_count = 0, order_pages = 0;
+  double formula_ms = 0, assemble_ms = 0, table_ms = 0, order_ms = 0;
 
  private:
   void close() {
@@ -217,8 +218,11 @@ class AssemblyStage {
         }
         const auto t = Clock::now();
         AssembledPage page = assemble_page(r.page, r.width, r.height, r.layout, w.items, merge_into_lines(w.items),
-                                           r.formulas, model_tables);
-        assemble_ms += ms_since(t);
+                                           r.formulas, model_tables, ordernet_ ? &models_.ordernet() : nullptr,
+                                           models_.table_stream());
+        const double ams = ms_since(t);
+        assemble_ms += ams;
+        if (page.ordered_by_model) ++order_pages, order_ms += ams;
         r.markdown = std::move(page.markdown);
         r.tables = std::move(page.tables);
         r.reading_order = std::move(page.order);
@@ -231,6 +235,7 @@ class AssemblyStage {
 
   ModelSet &models_;
   const PageSink &sink_;
+  const bool ordernet_;
   mutable std::mutex mu_;
   std::condition_variable cv_;
   std::deque<PageWork> q_;
@@ -266,7 +271,7 @@ class DocumentRun {
     for (int s = pool_.slots() - 1; s >= 0; --s) free_slots_.push_back(s);
     const int formula_steps0 = m_.has_formula() ? m_.formula().steps_run : 0;
 
-    AssemblyStage assembly(m_, sink_);
+    AssemblyStage assembly(m_, sink_, opt_.ordernet);
     assembly_ = &assembly;
     try {
       submit_ready();
@@ -303,6 +308,8 @@ class DocumentRun {
     stats_.table_pages = assembly.table_pages;
     stats_.model_tables = assembly.model_table_count;
     stats_.table_ms = assembly.table_ms;
+    stats_.order_pages = assembly.order_pages;
+    stats_.order_ms = assembly.order_ms;
     stats_.lines = assembly.lines;
     stats_.formula_steps = m_.has_formula() ? m_.formula().steps_run - formula_steps0 : 0;
     stats_.wall_ms = ms_since(t_start);

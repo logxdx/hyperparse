@@ -11,6 +11,10 @@
 
 #include "dfine_layout.h"
 
+namespace hp::on {
+class OrderNet;
+}
+
 namespace hp {
 
 struct PageLine {
@@ -44,6 +48,7 @@ struct AssembledPage {
   std::vector<PageTable> tables;
   std::vector<int> order;  // reading order over `lines` (after line merging)
   std::vector<PageLine> lines;
+  bool ordered_by_model = false;  // OrderNet decided order and blocks
 };
 
 // Merge word/phrase items (extraction order) into visual lines. inline_ocr items are
@@ -57,6 +62,7 @@ std::vector<PageLine> merge_into_lines(const std::vector<PageLine> &items);
 AssembledPage assemble_page(int page_index, int w, int h, const std::vector<LayoutBox> &layout,
                             const std::vector<PageLine> &items, std::vector<PageLine> lines,
                             const std::vector<PageFormula> &formulas,
-                            const std::vector<ModelTable> &model_tables = {});
+                            const std::vector<ModelTable> &model_tables = {},
+                            on::OrderNet *ordernet = nullptr, void *stream = nullptr);
 
 }  // namespace hp

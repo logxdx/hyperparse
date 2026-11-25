@@ -8,6 +8,7 @@
 #include "core/layout/layout_types.h"
 #include "core/markdown/markdown_export.h"
 #include "table_grid.h"
+#include "ordernet/page.h"
 #include "core/pipeline/pipeline_result.h"
 #include "core/pipeline/reading_order_util.h"
 
@@ -84,7 +85,8 @@ std::vector<PageLine> merge_into_lines(const std::vector<PageLine> &in) {
 
 AssembledPage assemble_page(int page_index, int w, int h, const std::vector<LayoutBox> &layout_in,
                             const std::vector<PageLine> &items, std::vector<PageLine> lines,
-                            const std::vector<PageFormula> &formulas, const std::vector<ModelTable> &model_tables) {
+                            const std::vector<PageFormula> &formulas, const std::vector<ModelTable> &model_tables,
+                            on::OrderNet *ordernet, void *stream) {
   AssembledPage page;
   // ── layout in the PP vocabulary ──
   struct L { LayoutBox b; int cls; int src; };
@@ -198,6 +200,19 @@ AssembledPage assemble_page(int page_index, int w, int h, const std::vector<Layo
     }
     res.tables.push_back(std::move(t));
     page.tables.push_back(std::move(pt));
+  }
+  // OrderNet: reading order and blocks over the page's lines (ordernet/page.h). Without it, or on a
+  // page it cannot take (under 2 or over 2048 lines), XY-cut over the regions and the region renderer.
+  if (ordernet) {
+    on::PageOrder po = on::order_page(*ordernet, static_cast<cudaStream_t>(stream), w, h, layout_in, lines, formulas,
+                                      page.tables);
+    if (po.ok) {
+      page.markdown = std::move(po.markdown);
+      page.order = std::move(po.order);
+      page.lines = std::move(lines);
+      page.ordered_by_model = true;
+      return page;
+    }
   }
   hp::core::pipeline::maybe_assign_reading_order(true, res.results, res.layout, res.reading_order);
   page.markdown = hp::core::markdown::render_markdown(res);

@@ -30,6 +30,9 @@ struct ParseOptions {
   // branch were trained on 150 DPI renders (text-only pages otherwise render just large enough
   // for the 960 px layout canvas, ~80 DPI for A4). 0 keeps the small render.
   int tables_dpi = 150;
+  // Reading order and Markdown blocks from OrderNet (if the engine loaded it); otherwise XY-cut over
+  // the layout regions and hp's region renderer.
+  bool ordernet = true;
   // Reject documents with more pages than this (PageLimitError) before any page
   // is rendered. 0 = no limit.
   int max_pages = 0;
@@ -104,6 +107,8 @@ struct ParseStats {
 
   int table_pages = 0, model_tables = 0;  // pages LayoutNet ran on, tables it returned
   double table_ms = 0;                    // LayoutNet on the assembly thread (features, net, decode)
+  int order_pages = 0;                     // pages ordered by OrderNet (the rest: XY-cut)
+  double order_ms = 0;                     // OrderNet on the assembly thread (features, net, decode, Markdown)
 };
 
 }  // namespace hp

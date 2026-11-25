@@ -23,7 +23,7 @@ namespace {
 
 constexpr const char *kUsage =
     "usage: hyperparse <in.pdf> [options]\n"
-    "       hyperparse --prepare-models [--models DIR] [--no-formula] [--no-tables] [--ocr none]\n"
+    "       hyperparse --prepare-models [--models DIR] [--no-formula] [--no-tables] [--no-ordernet] [--ocr none]\n"
     "\n"
     "Parses a PDF on the GPU into layout regions, text lines, formulas (LaTeX) and\n"
     "Markdown. Results go to --out and/or --md; throughput stats go to stderr.\n"
@@ -40,6 +40,7 @@ constexpr const char *kUsage =
     "  --no-formula           skip formula recognition\n"
     "  --no-tables            table cells from geometry instead of the LayoutNet model\n"
     "  --tables-dpi N         text-only pages with tables render at N DPI for LayoutNet (150)\n"
+    "  --no-ordernet          reading order by XY-cut instead of the OrderNet model\n"
     "  --rec budget|bucket    text-recognition batching (budget)\n"
     "\n"
     "Engine:\n"
@@ -91,6 +92,7 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--models") a.engine.models.dir = next();
     else if (k == "--no-formula") a.engine.models.formula = a.parse.formulas = false;
     else if (k == "--no-tables") a.engine.models.tables = a.parse.tables = false;
+    else if (k == "--no-ordernet") a.engine.models.ordernet = a.parse.ordernet = false;
     else if (k == "--tables-dpi") a.parse.tables_dpi = to_int(k, next());
     else if (k == "--no-warmup") a.warmup = false;
     else if (k == "--prepare-models") a.prepare_only = true;
@@ -127,14 +129,16 @@ void print_stats(const hp::ParseStats &s) {
                "assembly %.2f ms/page\n"
                "  region-only det on %d partial pages (mean canvas %.2f MP); %d text-layer boxes recognised without det\n"
                "  formulas: %d recognised in %d batches, %.1f ms each on the assembly thread (%d decode steps)\n"
-               "  tables: LayoutNet on %d pages with Table regions, %d tables, %.1f ms per page on the assembly thread\n",
+               "  tables: LayoutNet on %d pages with Table regions, %d tables, %.1f ms per page on the assembly thread\n"
+               "  reading order: OrderNet on %d pages, %.1f ms per page on the assembly thread (with Markdown)\n",
                s.pages, parse_ms, s.pages * 1000.0 / std::max(parse_ms, 1e-3), s.failed,
                s.load_ms > 0 ? (" + " + std::to_string(static_cast<int>(s.load_ms)) + " ms model load").c_str() : "",
                s.routes[0], s.routes[1], s.routes[2], s.lines, s.rec_boxes, s.det_boxes, s.text_ms / n, s.render_ms / n,
                per_ocr(s.ocr_ms), per_ocr(s.det_ms), per_ocr(s.rec_ms), s.layout_wait_ms / n, s.assemble_ms / n,
                s.region_det_pages, s.region_det_pages ? s.region_det_canvas_px / s.region_det_pages / 1e6 : 0.0,
                s.direct_rec_boxes, s.formulas, s.formula_batches, s.formulas ? s.formula_ms / s.formulas : 0.0,
-               s.formula_steps, s.table_pages, s.model_tables, s.table_pages ? s.table_ms / s.table_pages : 0.0);
+               s.formula_steps, s.table_pages, s.model_tables, s.table_pages ? s.table_ms / s.table_pages : 0.0,
+               s.order_pages, s.order_pages ? s.order_ms / s.order_pages : 0.0);
 }
 
 }  // namespace
@@ -142,7 +146,8 @@ void print_stats(const hp::ParseStats &s) {
 int main(int argc, char **argv) try {
   std::setlocale(LC_CTYPE, "C.UTF-8");
   Args a = parse_args(argc, argv);
-  a.engine.models.dir = hp::prepare_models(a.engine.models.dir, {a.engine.models.ocr, a.engine.models.formula, a.engine.models.tables});
+  a.engine.models.dir = hp::prepare_models(a.engine.models.dir, {a.engine.models.ocr, a.engine.models.formula, a.engine.models.tables,
+                                                                       a.engine.models.ordernet});
   if (a.prepare_only) {
     std::printf("%s\n", a.engine.models.dir.c_str());
     return 0;

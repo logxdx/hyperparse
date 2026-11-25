@@ -30,7 +30,8 @@ constexpr const char *kUsage =
     "  --rec budget|bucket    recognizer batching (budget)\n"
     "  --no-ocr               don't load det/rec (text layer + layout only)\n"
     "  --no-formula           don't load the formula model\n"
-    "  --no-tables            don't load LayoutNet (table cells from text geometry instead)\n";
+    "  --no-tables            don't load LayoutNet (table cells from text geometry instead)\n"
+    "  --no-ordernet          don't load OrderNet (reading order by XY-cut instead)\n";
 
 int to_int(const std::string &k, const std::string &v) {
   char *end = nullptr;
@@ -49,7 +50,7 @@ std::string env_name(const std::string &flag) {
 const std::vector<std::string> kValueFlags = {
     "--host",       "--port",     "--io-threads", "--max-queue", "--queue-timeout-ms", "--max-body-mb", "--max-pages",
     "--shutdown-grace", "--idle-unload", "--models", "--workers",  "--det-side",         "--rec"};
-const std::vector<std::string> kSwitches = {"--no-warmup", "--no-ocr", "--no-formula", "--no-tables"};
+const std::vector<std::string> kSwitches = {"--no-warmup", "--no-ocr", "--no-formula", "--no-tables", "--no-ordernet"};
 
 }  // namespace
 
@@ -89,6 +90,7 @@ ServerConfig parse_server_config(int argc, char **argv) {
     else if (k == "--no-ocr") c.engine.models.ocr = false;
     else if (k == "--no-formula") c.engine.models.formula = false;
     else if (k == "--no-tables") c.engine.models.tables = false;
+    else if (k == "--no-ordernet") c.engine.models.ordernet = false;
     else if (k == "--rec") {
       const std::string v = next();
       if (v != "budget" && v != "bucket") throw std::runtime_error("--rec budget|bucket");
