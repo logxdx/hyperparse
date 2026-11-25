@@ -1,7 +1,10 @@
 #include "ordernet/page.h"
 
 #include <algorithm>
+#include <array>
 #include <string_view>
+
+#include "tablenet/text.h"
 
 namespace hp::on {
 namespace {
@@ -13,6 +16,22 @@ bool inside(const PageLine &l, const LayoutBox &r) {
 }
 
 bool is_class(const LayoutBox &b, std::string_view name) { return kDfineLabels[b.cls] == name; }
+
+// A line of running text: >= 25 characters, >= 4 spaces, and lower-case letters for most of its
+// letters (table cells are short, numeric or capitalised).
+bool is_prose_line(const std::string &text) {
+  const std::u32string t = tn::utf32(text);
+  if (t.size() < 25) return false;
+  int spaces = 0, letters = 0, lower = 0;
+  for (char32_t c : t) {
+    spaces += c == U' ';
+    if (tn::is_alphabetic(c)) {
+      ++letters;
+      lower += tn::is_lowercase(c);
+    }
+  }
+  return spaces >= 4 && letters > 0 && lower * 10 >= letters * 6;
+}
 
 std::string strip_ascii_ws(std::string s) {
   const auto a = s.find_first_not_of(" \t\r\n\f\v");
@@ -99,7 +118,39 @@ PageOrder order_page(OrderNet &net, cudaStream_t stream, int w, int h, const std
   const int n = static_cast<int>(in.size());
   if (n < 2 || n > kMaxLines) return out;
 
-  const Heads heads = net.forward(line_features(in, static_cast<float>(w), static_cast<float>(h)), n, stream);
+  Heads heads = net.forward(line_features(in, static_cast<float>(w), static_cast<float>(h)), n, stream);
+  // A region line (formula, table) is a block of its own and plain Text: grouped with other lines,
+  // a Table block would rebuild a grid around the placeholder (and nest the real table in a cell),
+  // and a furniture class would drop it. Only the block structure changes; the order head stays.
+  const int n_kept = n - static_cast<int>(regions.size());
+  for (int j = n_kept; j < n; ++j) {
+    for (int i = 0; i < n; ++i)
+      if (i != j) heads.same[static_cast<size_t>(i) * n + j] = heads.same[static_cast<size_t>(j) * n + i] = -50.f;
+    for (int c = 0; c < kClasses; ++c) heads.cls[static_cast<size_t>(j) * kClasses + c] = c == 0 ? 50.f : -50.f;
+  }
+  // OrderNet's grid classes (Table, Table-Of-Contents, Form) on the remaining lines: a block of them
+  // is read row by row and rebuilt as a geometric table. That finds tables D-FINE missed or cut
+  // (olmOCR table tests 68 -> 72.8, OmniDocBench TEDS 0.640 -> 0.658), but dense multi-column prose
+  // read as a table interleaves its columns (long_tiny_text 79 -> 67). A grid block whose lines are
+  // mostly prose (>= 25 characters, >= 4 spaces, mostly lower-case letters) reads as text instead.
+  {
+    const std::vector<int> first = decode_blocks_order(heads, in);
+    bool changed = false;
+    for (const std::vector<int> &blk : split_blocks(first, heads)) {
+      std::array<float, kClasses> sum{};
+      for (int i : blk)
+        for (int c = 0; c < kClasses; ++c) sum[c] += heads.cls[static_cast<size_t>(i) * kClasses + c];
+      const int cls = static_cast<int>(std::max_element(sum.begin(), sum.end()) - sum.begin());
+      if (cls != 5 && cls != 8 && cls != 9) continue;
+      int prose = 0;
+      for (int i : blk) prose += is_prose_line(in[i].text);
+      if (prose * 2 < static_cast<int>(blk.size())) continue;
+      for (int i : blk)
+        for (int c : {5, 8, 9}) heads.cls[static_cast<size_t>(i) * kClasses + c] = -50.f;
+      changed = true;
+    }
+    (void)changed;
+  }
   const std::vector<int> order = decode_blocks_order(heads, in);
   std::string md = page_markdown(in, order, heads, /*keep_furniture=*/false);
   for (const Region &r : regions) {

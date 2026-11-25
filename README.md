@@ -33,9 +33,9 @@ Measured on an RTX 4050 Laptop GPU (6 GB):
 
 | Set | Pages | Throughput | Notes |
 |---|---|---|---|
-| IDL scans ([pixparse/idl-wds](https://huggingface.co/datasets/pixparse/idl-wds)) | 751 | 16.5 pages/s | word F1 0.894 against AWS Textract's OCR of the same pages |
-| Scientific papers | 60 | 13.7 pages/s | 98 formulas |
-| Mixed documents | 100 | 12.2 pages/s | 118 formulas |
+| IDL scans ([pixparse/idl-wds](https://huggingface.co/datasets/pixparse/idl-wds)) | 751 | 19.3 pages/s | word F1 0.894 against AWS Textract's OCR of the same pages |
+| Scientific papers | 60 | 15.2 pages/s | 98 formulas, 30 tables |
+| Mixed documents | 100 | 14.0 pages/s | 118 formulas, 22 tables |
 
 With the models loaded it uses about 3 GB of GPU memory. They unload after an
 idle timeout and reload on the next request in about 0.6 s.
@@ -50,7 +50,7 @@ idle timeout and reload on the next request in about 0.6 s.
 | **PDFium** ([run-llama's fork](https://github.com/run-llama/pdfium-binaries)) | Robust rendering and text extraction, plus the per-glyph font data that glyph recovery needs. |
 | **D-FINE** (from [SoMark OXR-1.0](https://github.com/SoMarkAI)) | An accurate real-time layout detector: about 14 ms per page at 960² in FP16. |
 | **PP-OCRv6 small, PP-FormulaNet-S** ([PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)) | Small, fast OCR and formula models that fit next to the layout model in 6 GB. |
-| **OrderNet** (from [Indra OCR](https://huggingface.co/datalab-to/indra-ocr)) | A 0.73M-parameter reading-order model over text lines: pairwise order, block classes and same-block links. Against XY-cut: olmOCR-bench 52.1 → 54.1 (order tests 43.5 → 52.2, multi-column 60 → 72), OmniDocBench reading-order Kendall tau 0.88 → 0.95. Its decoding and Markdown rendering are ported from indra_ocr and checked against it (`tests/ordernet_parity_test.cpp`). |
+| **OrderNet** (from [Indra OCR](https://huggingface.co/datalab-to/indra-ocr)) | A 0.73M-parameter reading-order model over text lines: pairwise order, block classes and same-block links, FP16 on TensorRT (~0.4 ms for 256 lines). Against XY-cut: olmOCR-bench 52.3 → 55.6 (order tests 43.5 → 55.7, multi-column 60 → 77, tables 68 → 72.8), OmniDocBench reading-order Kendall tau 0.87 → 0.94–0.95, at 1–3 ms per page on the assembly thread. Its decoding and Markdown are ported from indra_ocr and checked against it (`tests/ordernet_parity_test.cpp`). |
 | **LayoutNet** (from [OCRia-nano-1](https://huggingface.co/llamaindex/OCRia-nano-1)) | A 4.3M-parameter table-structure model over text units and the page image, run on the pages where D-FINE finds a table. Against geometry-only grids: OmniDocBench TEDS 0.480 → 0.643 (135 tables), olmOCR-bench table tests 53.4 → 68.0, at about 25 ms per table page on the assembly thread. Its features and decoder are ported from liteparse and checked against it page by page (`tests/tablenet_parity.cpp`). |
 | **[Drogon](https://github.com/drogonframework/drogon)** | A fast asynchronous C++ HTTP server. |
 

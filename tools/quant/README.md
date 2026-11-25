@@ -23,3 +23,16 @@ CPU checks against FP32 (ONNX Runtime; TensorRT numerics differ slightly):
 | OrderNet INT8 | 54.1 | order tau 0.949 | order 76%, Markdown 51% |
 | LayoutNet FP16 | | TEDS 0.511 (0.511) | tables on 94% / 99% of pages |
 | LayoutNet INT8 | | TEDS 0.498 | tables on 48% / 89% of pages |
+
+On TensorRT 11.5 (RTX 4050), forward pass incl. copies, ms at N = 64 / 256 / 1024:
+
+| | FP32 | FP16 | INT8 |
+|---|---|---|---|
+| OrderNet | 0.36 / 0.50 / 3.90 | 0.30 / 0.40 / 2.40 | 0.27 / 0.39 / 2.06 |
+| LayoutNet | 1.27 / 1.70 / 9.50 | 0.81 / 1.18 / 6.56 | 0.84 / 1.25 / 7.41 |
+
+TensorRT against the FP32 reference: OrderNet FP16 order identical on 290 / 334 pages (INT8 256);
+LayoutNet FP16 tables identical on 92 / 100 OCR pages and 136 / 140 text-layer pages (INT8 54, 124).
+So FP16 is the default for both; INT8 LayoutNet is slower and less accurate than FP16 here.
+`order_fp16.onnx` keeps the class head (`/cls/*`) in FP32 (`--nodes_to_exclude '/cls/.*'`): all
+FP16, TensorRT 11.5 fails with a misaligned-address error in a fused kernel.

@@ -5,9 +5,12 @@
 //   - each formula region becomes one "$<latex>$" line and each table region one placeholder
 //     line (the region's own lines are dropped), so OrderNet places them in the flow;
 //   - OrderNet orders and groups the rest: blocks, headings, lists, display math, paragraphs;
-//   - placeholders are replaced by the regions' tables (LayoutNet HTML or table_grid Markdown).
-// On olmOCR-bench this scored 54.1 vs 52.1 for XY-cut (order tests 43.5 -> 52.2, multi-column
-// 60 -> 72); on OmniDocBench reading-order Kendall tau 0.88 -> 0.95.
+//   - placeholders are replaced by the regions' tables (LayoutNet HTML or table_grid Markdown);
+//   - region lines are blocks of their own, classed Text; OrderNet's grid classes (Table, Form,
+//     Table-Of-Contents) are kept for tables D-FINE missed, except on blocks of prose lines.
+// End to end (FP16 engines, RTX 4050): olmOCR-bench 55.6 vs 52.3 for XY-cut (order tests 43.5 -> 55.7,
+// multi-column 60 -> 77, tables 68 -> 72.8); OmniDocBench reading-order Kendall tau 0.87 -> 0.945,
+// table TEDS 0.640 -> 0.658; 1-3 ms per page on the assembly thread.
 
 #include <string>
 #include <vector>
