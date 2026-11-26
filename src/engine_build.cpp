@@ -81,6 +81,11 @@ std::vector<PlanSpec> make_specs() {
     s.push_back({std::string("order_") + v + ".onnx", order_plan(v), ModelGroup::kOrder,
                  {{{"feats", {1, 2, 16}, {1, 256, 16}, {1, 2048, 16}}, {"mask", {1, 2}, {1, 256}, {1, 2048}}}},
                  2.0, v});
+  // Page orientation (PP-LCNet_x1_0_doc_ori, FP32, fixed 1x3x224x224; orient.h). Optional: only
+  // when doc_ori.onnx is in the models dir.
+  PlanSpec ori{"doc_ori.onnx", "doc_ori.plan", ModelGroup::kOcr, {{fixed("x", {1, 3, 224, 224})}}, 1.0};
+  ori.optional = true;
+  s.push_back(std::move(ori));
   return s;
 }
 

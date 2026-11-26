@@ -21,6 +21,7 @@ nlohmann::json page_to_json(const PageResult &p, bool with_markdown) {
                       {"w", p.width},
                       {"h", p.height},
                       {"dpi", p.dpi},
+                      {"rotation", p.rotation},
                       {"route", route_name(p.route)},
                       {"reasons", reasons_str(p.route_reasons)},
                       {"ocr_regions", regions},

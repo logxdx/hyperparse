@@ -17,6 +17,7 @@
 #include "cuda_raii.h"
 #include "dfine_layout.h"
 #include "formula.h"
+#include "orient.h"
 #include "text_det.h"
 #include "text_recognizer.h"
 #include "ordernet/net.h"
@@ -38,6 +39,7 @@ struct ModelConfig {
   bool formula = true;           // load PP-FormulaNet-S
   bool tables = true;            // load LayoutNet (table structure in Table layout regions)
   bool ordernet = true;          // load OrderNet (reading order and block structure)
+  bool orient = true;            // load the page-orientation model when the models dir has it (orient.h)
   std::string tables_precision = "fp16";  // LayoutNet plan: fp16 | int8
   std::string order_precision = "fp16";   // OrderNet plan: fp16 | int8
   RecMode rec = RecMode::kColumnBudget;
@@ -95,6 +97,8 @@ class ModelSet {
   [[nodiscard]] cudaStream_t table_stream() const { return table_stream_; }
   [[nodiscard]] bool has_ordernet() const { return ordernet_ != nullptr; }
   [[nodiscard]] on::OrderNet &ordernet() { return *ordernet_; }
+  [[nodiscard]] bool has_orient() const { return orient_ != nullptr; }
+  [[nodiscard]] DocOrient &orient() { return *orient_; }
   [[nodiscard]] TextDet &det() { return *det_; }
   [[nodiscard]] CropBatch &det_crops() { return det_crops_; }
   [[nodiscard]] TextRecognizer &rec() { return *rec_; }
@@ -115,6 +119,7 @@ class ModelSet {
   std::unique_ptr<FormulaRecognizer> formula_;
   std::unique_ptr<tn::TableNet> tablenet_;
   std::unique_ptr<on::OrderNet> ordernet_;
+  std::unique_ptr<DocOrient> orient_;
 };
 
 }  // namespace hp

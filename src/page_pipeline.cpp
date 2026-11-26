@@ -16,6 +16,7 @@
 #include "assemble.h"
 #include "multi_resize.h"
 #include "ocr_stage.h"
+#include "orient.h"
 #include "pdf_render.h"
 #include "tablenet/features.h"
 #include "tablenet/page.h"
@@ -48,6 +49,9 @@ struct PageWork {
   // render in grey (copied out of the slot), for ruling lines and the image branch
   tn::PageUnits units;
   std::vector<uint8_t> grey;
+  // A scan parsed upright (orient.h): how far its content was turned clockwise, and the page's size
+  // as rendered; the assembled page's coordinates are mapped back to that frame.
+  int rot = 0, w0 = 0, h0 = 0;
 };
 
 bool has_table_region(const std::vector<LayoutBox> &layout) {
@@ -228,6 +232,12 @@ class AssemblyStage {
         r.reading_order = std::move(page.order);
         r.lines = std::move(page.lines);
         lines += static_cast<int>(r.lines.size());
+        if (w.rot) {
+          const float W0 = static_cast<float>(w.w0), H0 = static_cast<float>(w.h0);
+          for (LayoutBox &b : r.layout) box_to_original(b.x0, b.y0, b.x1, b.y1, w.rot, W0, H0);
+          for (PageLine &l : r.lines) box_to_original(l.x0, l.y0, l.x1, l.y1, w.rot, W0, H0);
+          r.width = w.w0, r.height = w.h0, r.rotation = w.rot;
+        }
       }
       sink_(std::move(r));
     }
@@ -375,22 +385,35 @@ class DocumentRun {
     stats_.text_ms += d.text_ms;
     stats_.render_ms += d.render_ms;
 
-    const PageGeometry g{d.w, d.h, d.dpi};
-    const size_t bytes = static_cast<size_t>(d.w) * d.h * 3;
+    // A scan turned sideways or upside down (orient.h) is turned upright in the slot before anything
+    // reads it; the assembly thread maps the page's coordinates back. Only pages read wholly from
+    // pixels: no text-layer item or box (page coordinates of the unturned page) takes part.
+    job.work.w0 = d.w, job.work.h0 = d.h;
+    if (m_.has_orient() && job.rt.kind == kFullOcr && job.rt.rec_boxes.empty() &&
+        std::none_of(job.pt.items.begin(), job.pt.items.end(), [](const TextItem &it) { return !it.dropped; })) {
+      const OrientResult o = m_.orient().classify(pool_.pixels(d.slot), d.w, d.h, m_.ocr_stream());
+      if (o.degrees_cw != 0 && o.conf >= kOrientMinConf) {
+        rotate_upright_bgr(pool_.pixels(d.slot), job.done.w, job.done.h, o.degrees_cw);
+        job.work.rot = o.degrees_cw;
+      }
+    }
+    const int W = job.done.w, H = job.done.h;
+    const PageGeometry g{W, H, d.dpi};
+    const size_t bytes = static_cast<size_t>(W) * H * 3;
     uint8_t *page = lane.page_buffer(bytes);
     CUDA_CHECK(cudaMemcpyAsync(page, pool_.pixels(d.slot), bytes, cudaMemcpyHostToDevice, lane.stream));
     const OcrPlan plan = plan_ocr(m_, job.rt, g, true);
     ResizeTable table;
-    table.add(lane.layout.resize_spec(d.w, d.h));
-    if (plan.need_det && !plan.region_det) table.add(m_.det().resize_spec(d.w, d.h));
-    launch_multi_resize(page, static_cast<size_t>(d.w) * 3, d.w, d.h, table, lane.stream);
+    table.add(lane.layout.resize_spec(W, H));
+    if (plan.need_det && !plan.region_det) table.add(m_.det().resize_spec(W, H));
+    launch_multi_resize(page, static_cast<size_t>(W) * 3, W, H, table, lane.stream);
     CUDA_CHECK(cudaEventRecord(lane.resized, lane.stream));
     lane.layout.enqueue(lane.stream);
 
     PageResult &r = job.work.result;
     r.page = d.page;
-    r.width = d.w;
-    r.height = d.h;
+    r.width = W;
+    r.height = H;
     r.dpi = d.dpi;
     r.route = job.rt.kind;
     r.route_reasons = job.rt.reasons;

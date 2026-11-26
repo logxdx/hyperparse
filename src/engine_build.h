@@ -24,7 +24,9 @@ struct PlanSpec {
   ModelGroup group;
   std::vector<Profile> profiles;
   double workspace_gb = 2.0;
-  std::string variant;  // precision variant ("fp16", "int8") for models that have several; "" = the only one
+  std::string variant = {};  // precision variant ("fp16", "int8") for models that have several; "" = the only one
+  // Built and loaded only when its ONNX is in the models dir (a model the HF repo may not carry yet).
+  bool optional = false;
 };
 
 // LayoutNet (OCRia-nano-1's tablenet) and OrderNet (Indra OCR's order) come in reduced-precision

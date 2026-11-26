@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
+#include <fstream>
 #include <stdexcept>
 #include <vector>
 
@@ -46,6 +47,11 @@ ModelSet::ModelSet(const ModelConfig &cfg) : cfg_(cfg) {
     t = Clock::now();
     rec_ = load_text_recognizer(cfg_.rec, d + "/rec_small_fp16.plan", d + "/keys_small.txt", ocr_stream_);
     load_times_.rec_ms = ms_since(t);
+    // Page orientation: optional (doc_ori.plan exists only when the models dir carries doc_ori.onnx).
+    if (cfg_.orient && std::ifstream(d + "/doc_ori.plan").good()) {
+      orient_ = std::make_unique<DocOrient>();
+      if (!orient_->load(d + "/doc_ori.plan")) throw std::runtime_error("orientation load failed: " + d);
+    }
   }
   if (cfg_.formula) {
     t = Clock::now();
@@ -164,6 +170,10 @@ void ModelSet::warmup() {
     im.px.assign(static_cast<size_t>(im.w) * im.h, 255);
     im.k = 1024.f / 792.f;
     (void)tablenet_->forward(feats, pairf, static_cast<int>(units.size()), tn::image_input(im, units), table_stream_);
+  }
+  if (orient_) {
+    const std::vector<uint8_t> blank(static_cast<size_t>(300) * 400 * 3, 255);
+    (void)orient_->classify(blank.data(), 300, 400, ocr_stream_);
   }
   if (ordernet_) {
     // Two columns of four lines: one forward pass at a small N (runs on the assembly thread's stream).

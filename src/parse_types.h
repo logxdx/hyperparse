@@ -62,6 +62,8 @@ struct PageResult {
   std::string error;  // set when !ok: render failure, worker crash or page timeout
 
   int width = 0, height = 0;  // rendered page px; every coordinate below is in these
+  int rotation = 0;           // scans: degrees the content was turned clockwise (orient.h); parsed upright,
+                              // coordinates mapped back to the page as rendered
   float dpi = 0;
   int route = kNative;        // RouteKind
   unsigned route_reasons = 0; // Reason bits; reasons_str() for text
