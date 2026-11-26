@@ -325,6 +325,10 @@ std::vector<HSeg> collect_hsegs(FPDF_PAGE page, const Viewport &vp) {
   return out;
 }
 
+// Bit set in a font's flags (above the PDF's 19 defined ones) once its glyphs measured proportional.
+constexpr int kMeasuredProportional = 1 << 30;
+void font_proportional_mark(int &flags) { flags = (flags & ~1) | kMeasuredProportional; }
+
 bool name_has(const std::string &name, std::initializer_list<const char *> hints) {
   for (const char *h : hints)
     if (name.find(h) != std::string::npos) return true;
@@ -347,8 +351,9 @@ void assign_styles(PageText &pt, const std::vector<int> &flags, const std::vecto
     if ((f & kForceBold) || weight[it.font] >= 600 || name_has(n, {"Bold", "Black", "Heavy", "Semibold", "Demibold"}))
       it.style |= kStyleBold;
     if ((f & kItalicFlag) || name_has(n, {"Italic", "Oblique"})) it.style |= kStyleItalic;
-    if ((f & kFixedPitch) ||
-        name_has(n, {"Courier", "Mono", "Consolas", "Menlo", "Source Code", "Inconsolata", "Hack", "Fira Code"}))
+    if (!(f & kMeasuredProportional) &&
+        ((f & kFixedPitch) ||
+         name_has(n, {"Courier", "Mono", "Consolas", "Menlo", "Source Code", "Inconsolata", "Hack", "Fira Code"})))
       it.style |= kStyleMono;
   }
   // Strikethrough: a thin line through the item's middle band covering >= 60% of its width.
@@ -526,6 +531,8 @@ PageText extract_page_text(void *doc, int page_index) {
   int cur_first = 0;
   std::unordered_map<std::string, int> font_ids;
   std::vector<int> font_flags, font_weight;  // per PageText::fonts entry (first object seen)
+  std::vector<float> font_wmin, font_wmax;   // per font: narrowest / widest alphanumeric advance (per em)
+  std::vector<int> font_wn;
   TextItem cur;
   std::u32string cur32;
   RectF last{};
@@ -605,6 +612,7 @@ PageText extract_page_text(void *doc, int page_index) {
         pt.fonts.push_back(name);
         font_flags.push_back(flags);
         font_weight.push_back(FPDFText_GetFontWeight(tp, i));
+        font_wmin.push_back(1e9f), font_wmax.push_back(0.f), font_wn.push_back(0);
       }
       font = it->second;
     }
@@ -672,6 +680,11 @@ PageText extract_page_text(void *doc, int page_index) {
     cur.unmapped += map_error && !rec;
     pt.recovered += rec != nullptr;
     width_sum += b.w();
+    if (font >= 0 && fs > 0 && !lig && u < 0x80 && std::isalnum(static_cast<int>(u))) {
+      const float wn = b.w() / fs;
+      font_wmin[font] = std::min(font_wmin[font], wn), font_wmax[font] = std::max(font_wmax[font], wn);
+      ++font_wn[font];
+    }
     last = b;
     last_ink_bottom = ink_bottom;
     pending_space = false;
@@ -695,6 +708,10 @@ PageText extract_page_text(void *doc, int page_index) {
     pt.items.clear();
     for (auto &[k, it] : seq) pt.items.push_back(std::move(it));
   }
+  // Monospace only if the glyphs are: a font whose letters' advances differ by more than 30%
+  // ("i" vs "m") is proportional whatever its FixedPitch flag says (seen on embedded Roboto).
+  for (size_t f = 0; f < font_flags.size(); ++f)
+    if (font_wn[f] >= 8 && font_wmax[f] > 1.3f * font_wmin[f]) font_proportional_mark(font_flags[f]);
   assign_styles(pt, font_flags, font_weight, collect_hsegs(page, vp));
   for (TextItem &it : pt.items)
     if (it.has_band) it.box.y0 = std::min(it.box.y0, it.band_y0), it.box.y1 = std::max(it.box.y1, it.band_y1);

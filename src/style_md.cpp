@@ -89,8 +89,20 @@ std::string styled_markdown(const PageLine &line) {
 }
 
 void merge_adjacent_emphasis(std::string &md) {
+  // A word hyphenated across the line break inside one style ("expira-** **tion"): the line
+  // join saw "**" at the line end and kept the hyphen; join the word as plain text would be.
+  static constexpr std::string_view kHyphenJoins[] = {"-~~ ~~", "-</u> <u>", "-*** ***", "-** **", "-* *"};
+  auto is_alpha = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+  for (std::string_view from : kHyphenJoins)
+    for (size_t p = md.find(from); p != std::string::npos; p = md.find(from, p)) {
+      const size_t after = p + from.size();
+      if (p > 0 && is_alpha(md[p - 1]) && after < md.size() && md[after] >= 'a' && md[after] <= 'z')
+        md.erase(p, from.size());
+      else
+        p += from.size();
+    }
   static constexpr std::pair<std::string_view, std::string_view> kJoins[] = {
-      {"~~ ~~", " "}, {"</u> <u>", " "}, {"</u><u>", ""}, {"*** ***", " "}, {"** **", " "}};
+      {"~~ ~~", " "}, {"</u> <u>", " "}, {"</u><u>", ""}, {"*** ***", " "}, {"** **", " "}, {"` `", " "}};
   for (const auto &[from, to] : kJoins)
     for (size_t p = md.find(from); p != std::string::npos; p = md.find(from, p + to.size()))
       md.replace(p, from.size(), to);

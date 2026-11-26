@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <set>
+#include <string>
 #include <string_view>
 
 #include "style_md.h"
@@ -38,6 +41,26 @@ std::string strip_ascii_ws(std::string s) {
   const auto a = s.find_first_not_of(" \t\r\n\f\v");
   if (a == std::string::npos) return {};
   return s.substr(a, s.find_last_not_of(" \t\r\n\f\v") - a + 1);
+}
+
+// Lower-cased words (runs of ASCII alphanumerics and non-ASCII bytes) of `s`; with html, text
+// inside <...> tags is skipped.
+std::set<std::string> words_of(const std::string &s, bool html) {
+  std::set<std::string> out;
+  std::string cur;
+  bool tag = false;
+  for (const char ch : s) {
+    const auto c = static_cast<unsigned char>(ch);
+    if (html && c == '<') tag = true;
+    if (!tag && (std::isalnum(c) || c >= 0x80)) {
+      cur += static_cast<char>(std::tolower(c));
+      continue;
+    }
+    if (html && c == '>') tag = false;
+    if (!cur.empty()) out.insert(std::move(cur)), cur.clear();
+  }
+  if (!cur.empty()) out.insert(std::move(cur));
+  return out;
 }
 
 // Lines of `idx` top to bottom, left to right.
@@ -100,8 +123,21 @@ PageOrder order_page(OrderNet &net, cudaStream_t stream, int w, int h, const std
     if (t.layout_index < 0 || t.layout_index >= static_cast<int>(layout.size())) continue;
     const LayoutBox &r = layout[t.layout_index];
     std::vector<int> m = take_region(r);
-    regions.push_back({{{r.x0, r.y0, r.x1, r.y1}, "TBLHOLD" + std::to_string(k) + "X"}, std::move(m),
-                       t.html.empty() ? t.markdown : t.html, true});
+    const std::string &payload = t.html.empty() ? t.markdown : t.html;
+    // A line of the region the table does not contain (LayoutNet left out a header row, or put
+    // together only part of the box) stays a page line instead of being lost with the region:
+    // under half of its words appear in the table.
+    const std::set<std::string> in_table = words_of(payload, /*html=*/true);
+    std::erase_if(m, [&](int i) {
+      const std::set<std::string> w = words_of(lines[i].text, false);
+      if (w.empty()) return false;
+      size_t hit = 0;
+      for (const auto &x : w) hit += in_table.count(x);
+      if (hit * 2 >= w.size()) return false;
+      dropped[i] = 0;
+      return true;
+    });
+    regions.push_back({{{r.x0, r.y0, r.x1, r.y1}, "TBLHOLD" + std::to_string(k) + "X"}, std::move(m), payload, true});
   }
 
   // OrderNet input: kept lines in page order, then the region lines.
