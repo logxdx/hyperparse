@@ -148,6 +148,10 @@ add_library(hp_core STATIC
   src/ordernet/net.cpp
   src/ordernet/page.cpp
   src/glyph_decoder.cpp
+  src/tex_math/tex_math.cpp
+  src/tex_math/encodings.cpp
+  src/tex_math/structures.cpp
+  src/tex_math/collect.cpp
   src/formula.cu
   src/rec_batcher.cpp
   src/text_recognizer.cpp
@@ -163,6 +167,9 @@ target_include_directories(hp_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 # no fused multiply-adds.
 set_source_files_properties(src/tablenet/text.cpp src/tablenet/decode.cpp src/tablenet/units.cpp
   src/tablenet/features.cpp src/tablenet/page.cpp src/ordernet/order.cpp src/ordernet/text.cpp
+  PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
+# The TeX math pass (LiteParse tex_math port) compares f32 sums against thresholds like the Rust reference.
+set_source_files_properties(src/tex_math/tex_math.cpp src/tex_math/structures.cpp src/tex_math/collect.cpp
   PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 target_include_directories(hp_core SYSTEM PUBLIC ${TRT_INCLUDE_DIR} ${PDFIUM_DIR}/include ${JSON_INCLUDE_DIR})
 target_include_directories(hp_core SYSTEM PRIVATE ${CURL_INCLUDE_DIRS})
@@ -211,6 +218,11 @@ add_executable(tablenet_parity tests/tablenet_parity.cpp)
 target_link_libraries(tablenet_parity PRIVATE hp_core)
 target_compile_options(tablenet_parity PRIVATE -O2 -Wall -Wextra)
 set_target_properties(tablenet_parity PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
+add_executable(tex_math_parity tests/tex_math_parity.cpp)
+target_link_libraries(tex_math_parity PRIVATE hp_core)
+target_compile_options(tex_math_parity PRIVATE -O2 -Wall -Wextra)
+set_target_properties(tex_math_parity PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
 add_executable(engine_lifecycle_test tests/engine_lifecycle_test.cpp)
 target_link_libraries(engine_lifecycle_test PRIVATE hp_core)
