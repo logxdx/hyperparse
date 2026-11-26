@@ -37,8 +37,92 @@ Measured on an RTX 4050 Laptop GPU (6 GB):
 | Scientific papers | 60 | 15.2 pages/s | 98 formulas, 30 tables |
 | Mixed documents | 100 | 14.0 pages/s | 118 formulas, 22 tables |
 
-With the models loaded it uses about 3 GB of GPU memory. They unload after an
-idle timeout and reload on the next request in about 0.6 s.
+With the models loaded it peaks at about 3.4 GB of GPU memory. They unload after an
+idle timeout and reload on the next request in about 0.6 s. Full numbers:
+[Benchmarks](#benchmarks).
+
+## Benchmarks
+
+All on one RTX 4050 Laptop GPU (6 GB, sm89), TensorRT 11.5, 8 page workers, November 2026.
+"Before" is hp with XY-cut reading order and geometry-only tables (`--no-ordernet --no-tables`).
+
+### Accuracy
+
+**[olmOCR-bench](https://github.com/allenai/olmocr)**, 140-page stratified subset (835 tests), its
+own scorer:
+
+| Category | Before | hp | | Reference systems | |
+|---|---|---|---|---|---|
+| **Overall** | 49.9 | **55.6** | | OXR-1.0 (4B VLM, 0.05 pages/s) | 86.1 |
+| Order | 43.5 | **55.7** | | Indra OCR 1.1.2 (CPU) | 46.9 |
+| Multi-column | 61.3 | **77.3** | | LiteParse + OCRia-nano-1 (CPU) | 49.8 |
+| Tables | 53.4 | **72.8** | | | |
+| Headers / footers removed | 91.1 | **94.6** | | | |
+| Long tiny text | **79.3** | 75.0 | | | |
+| Old scans | 25.5 | **30.0** | | | |
+| arXiv math / old-scan math | 19.8 / 18.9 | 20.7 / 18.9 | | | |
+
+**[OmniDocBench](https://github.com/opendatalab/OmniDocBench)**, 100-page subset (45 Chinese, 44
+English, 11 mixed or other) and 100 extra table pages (135 tables):
+
+| Metric | Before | hp |
+|---|---|---|
+| Reading order, Kendall tau over text blocks | 0.876 | **0.943** |
+| Page text edit distance (lower is better) | 0.450 | **0.402** |
+| Table TEDS / TEDS-structure (135 tables) | 0.480 / 0.592 | **0.658 / 0.764** |
+| Text F1 (bag of words, CJK characters as words) | 0.933 | 0.933 |
+| Layout recall / precision at IoU 0.5, class accuracy (D-FINE) | 0.920 / 0.947 / 0.966 | same |
+
+**IDL scans**, 751 pages: word F1 0.894 against AWS Textract (P 0.887, R 0.902).
+
+**Display formulas**, 300 from OmniDocBench, rendered with KaTeX and compared as olmOCR-bench does:
+PP-FormulaNet-S 45.0% match (English pages 48.1%, Chinese 33.3%), LaTeX edit distance 0.239.
+
+How the other candidates compared, per stage, on the same pages:
+
+| Stage | Chosen | Alternatives |
+|---|---|---|
+| Layout (recall / class acc.) | D-FINE 0.920 / 0.966 | Indra 0.561 / 0.805, LayoutNet blocks 0.481 / 0.762 |
+| OCR (IDL word F1, OmniDocBench text F1) | PP-OCRv6 0.899 / 0.933 | Indra 0.885 / 0.918, OCRia-nano-1 0.879 / 0.894 |
+| Tables (TEDS) | LayoutNet 0.658 | geometry-only grid 0.480, Indra table heads 0.509 |
+| Reading order (Kendall tau) | OrderNet 0.943 | XY-cut 0.876 |
+| Formulas (render match) | PP-FormulaNet-S 45.0% | Indra math models 13.7–16.3% |
+
+### Throughput
+
+| Set | Pages | Pages/s | Routes (native / partial / full OCR) | Formulas | Tables |
+|---|---|---|---|---|---|
+| IDL scans | 751 | **19.3** | 3 / 4 / 744 | 26 | 198 |
+| Scientific papers | 60 | **15.2** | 14 / 37 / 9 | 97 | 30 |
+| OmniDocBench table pages (images) | 100 | **14.6** | 0 / 0 / 100 | 3 | 104 |
+| Mixed documents | 100 | **14.0** | 19 / 36 / 45 | 117 | 22 |
+| olmOCR-bench subset | 140 | **12.9** | 21 / 52 / 67 | 187 | 31 |
+| OmniDocBench (images, ~2000 px) | 100 | **9.9** | 0 / 0 / 100 | 104 | 29 |
+
+Per-page costs on these runs (the stages overlap: workers, GPU thread and assembly thread run
+concurrently):
+
+| Stage | Where | Cost |
+|---|---|---|
+| Text layer + routing | page workers | 0.5–8 ms per page |
+| Render | page workers | 14–30 ms per page (80–90 ms for ~2000 px images) |
+| OCR (det + rec) | GPU | 46–91 ms per OCR page (det 10–18, rec 32–73) |
+| Formulas | assembly thread | 37–70 ms per batch of up to 8 |
+| LayoutNet (features + net + decode) | assembly thread | 8–24 ms per page with a table |
+| OrderNet (features + net + decode + Markdown) | assembly thread | 0.9–3.2 ms per page |
+
+Model load 1.0–1.1 s from the engine cache (warm-up 0.2 s); reload after an idle unload ~0.6 s.
+
+Network latency in TensorRT, one page, including host-device copies (ms at N = 64 / 256 / 1024
+lines or units):
+
+| | FP32 | FP16 (shipped) | INT8 |
+|---|---|---|---|
+| OrderNet | 0.36 / 0.50 / 3.90 | 0.30 / 0.40 / 2.40 | 0.27 / 0.39 / 2.06 |
+| LayoutNet | 1.27 / 1.70 / 9.50 | 0.81 / 1.18 / 6.56 | 0.84 / 1.25 / 7.41 |
+
+FP16 matches FP32 on the benchmarks above; INT8 LayoutNet is slower and loses 1.4 TEDS points
+(`tools/quant`).
 
 ## Why this stack
 
