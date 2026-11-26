@@ -137,7 +137,9 @@ void print_stats(const hp::ParseStats &s) {
                "  region-only det on %d partial pages (mean canvas %.2f MP); %d text-layer boxes recognised without det\n"
                "  formulas: %d recognised in %d batches, %.1f ms each on the assembly thread (%d decode steps)\n"
                "  tables: LayoutNet on %d pages with Table regions, %d tables, %.1f ms per page on the assembly thread\n"
-               "  reading order: OrderNet on %d pages, %.1f ms per page on the assembly thread (with Markdown)\n",
+               "  reading order: OrderNet on %d pages, %.1f ms per page on the assembly thread (with Markdown)\n"
+               "  bound: GPU thread waited %.0f ms for renders (%.0f%% of wall); assembly busy %.0f ms (%.0f%%), "
+               "drain after the GPU thread %.0f ms\n",
                s.pages, parse_ms, s.pages * 1000.0 / std::max(parse_ms, 1e-3), s.failed,
                s.load_ms > 0 ? (" + " + std::to_string(static_cast<int>(s.load_ms)) + " ms model load").c_str() : "",
                s.routes[0], s.routes[1], s.routes[2], s.lines, s.rec_boxes, s.det_boxes, s.text_ms / n, s.render_ms / n,
@@ -145,7 +147,9 @@ void print_stats(const hp::ParseStats &s) {
                s.region_det_pages, s.region_det_pages ? s.region_det_canvas_px / s.region_det_pages / 1e6 : 0.0,
                s.direct_rec_boxes, s.formulas, s.formula_batches, s.formulas ? s.formula_ms / s.formulas : 0.0,
                s.formula_steps, s.table_pages, s.model_tables, s.table_pages ? s.table_ms / s.table_pages : 0.0,
-               s.order_pages, s.order_pages ? s.order_ms / s.order_pages : 0.0);
+               s.order_pages, s.order_pages ? s.order_ms / s.order_pages : 0.0, s.render_wait_ms,
+               100 * s.render_wait_ms / std::max(parse_ms, 1e-3), s.assembly_busy_ms,
+               100 * s.assembly_busy_ms / std::max(parse_ms, 1e-3), s.drain_ms);
 }
 
 }  // namespace

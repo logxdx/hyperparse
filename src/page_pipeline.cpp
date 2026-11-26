@@ -154,7 +154,7 @@ class AssemblyStage {
   }
 
   int formulas = 0, formula_batches = 0, lines = 0, table_pages = 0, model_table_count = 0, order_pages = 0;
-  double formula_ms = 0, assemble_ms = 0, table_ms = 0, order_ms = 0;
+  double formula_ms = 0, assemble_ms = 0, table_ms = 0, order_ms = 0, busy_ms = 0;
 
  private:
   void close() {
@@ -180,7 +180,9 @@ class AssemblyStage {
         if (cancelled_ || error_) continue;
       }
       try {
+        const auto t = Clock::now();
         process(batch);
+        busy_ms += ms_since(t);
       } catch (...) {
         std::lock_guard l(mu_);
         if (!error_) error_ = std::current_exception();
@@ -286,7 +288,9 @@ class DocumentRun {
     try {
       submit_ready();
       for (int done = 0; done < n_pages_;) {
+        const auto t_wait = Clock::now();
         const RenderPool::Done d = pool_.wait_done();
+        stats_.render_wait_ms += ms_since(t_wait);
         if (!accept(d)) continue;
         --outstanding_;
         ++done;
@@ -309,7 +313,10 @@ class DocumentRun {
       throw;
     }
     pool_.release_document();  // every job is done: nobody reads the memfd any more
+    const auto t_drain = Clock::now();
     assembly.finish();
+    stats_.drain_ms = ms_since(t_drain);
+    stats_.assembly_busy_ms = assembly.busy_ms;
 
     stats_.formulas = assembly.formulas;
     stats_.formula_batches = assembly.formula_batches;

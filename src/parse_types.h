@@ -111,6 +111,11 @@ struct ParseStats {
   double table_ms = 0;                    // LayoutNet on the assembly thread (features, net, decode)
   int order_pages = 0;                     // pages ordered by OrderNet (the rest: XY-cut)
   double order_ms = 0;                     // OrderNet on the assembly thread (features, net, decode, Markdown)
+
+  // Where the wall time goes (which stage bounds throughput).
+  double render_wait_ms = 0;   // GPU thread blocked waiting for a rendered page from the workers
+  double assembly_busy_ms = 0; // assembly thread working (formulas, LayoutNet, assembly, sink)
+  double drain_ms = 0;         // after the GPU thread's last page, until assembly is done
 };
 
 }  // namespace hp
