@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cwctype>
+#include <initializer_list>
 #include <map>
 #include <set>
 #include <string_view>
@@ -27,6 +28,7 @@ constexpr float kFullPageFrac = 0.9f;          // MAX_IMAGE_PAGE_COVERAGE
 constexpr float kUncoveredVectorArea = 400.f;  // UNCOVERED_VECTOR_AREA_THRESHOLD (pt^2)
 constexpr float kInvisibleLayerMinShare = 0.9f;
 constexpr float kYTol = 2.0f, kMaxInlineGap = 15.0f;
+constexpr float kMaxRuleThickness = 2.0f;      // STRIKE_MAX_THICKNESS_PT: strike / underline line
 
 // ── unicode helpers (glibc wide-char classes; locale set to C.UTF-8 by caller) ─
 bool is_alpha(char32_t c) { return c < 128 ? std::isalpha((int)c) : std::iswalpha((wint_t)c); }
@@ -281,6 +283,138 @@ std::vector<RectF> merge_rects(std::vector<RectF> rs, float gap) {
   return rs;
 }
 
+// ── inline styles (liteparse projection.rs font_is_bold / font_is_italic / is_mono_item,
+// extract.rs assign_strikethrough / assign_underline, projection.rs mark_script_items) ──
+
+// A thin horizontal mark: a stroked line or a thin filled rect (viewport pt; y = centre line).
+struct HSeg {
+  float x0, x1, y, h;
+};
+
+void collect_hsegs_obj(FPDF_PAGEOBJECT obj, const Mat &m, int depth, const Viewport &vp, std::vector<HSeg> &out) {
+  const int type = FPDFPageObj_GetType(obj);
+  if (type == FPDF_PAGEOBJ_FORM && depth < 4) {
+    FS_MATRIX fm;
+    Mat mm = m;
+    if (FPDFPageObj_GetMatrix(obj, &fm)) mm = mul(m, fm);
+    const int n = FPDFFormObj_CountObjects(obj);
+    for (int i = 0; i < n; ++i) collect_hsegs_obj(FPDFFormObj_GetObject(obj, i), mm, depth + 1, vp, out);
+    return;
+  }
+  if (type != FPDF_PAGEOBJ_PATH) return;
+  float l, bo, rt, t;
+  if (!FPDFPageObj_GetBounds(obj, &l, &bo, &rt, &t)) return;
+  if (depth > 0) {
+    const double xs[4] = {l, rt, rt, l}, ys[4] = {bo, bo, t, t};
+    double X0 = 1e9, Y0 = 1e9, X1 = -1e9, Y1 = -1e9;
+    for (int k = 0; k < 4; ++k) {
+      const double x = m.a * xs[k] + m.c * ys[k] + m.e, y = m.b * xs[k] + m.d * ys[k] + m.f;
+      X0 = std::min(X0, x); X1 = std::max(X1, x); Y0 = std::min(Y0, y); Y1 = std::max(Y1, y);
+    }
+    l = (float)X0; bo = (float)Y0; rt = (float)X1; t = (float)Y1;
+  }
+  const RectF v = vp.rect(l, bo, rt, t);
+  if (v.h() <= kMaxRuleThickness && v.w() > v.h()) out.push_back({v.x0, v.x1, 0.5f * (v.y0 + v.y1), v.h()});
+}
+
+std::vector<HSeg> collect_hsegs(FPDF_PAGE page, const Viewport &vp) {
+  std::vector<HSeg> out;
+  const int n = FPDFPage_CountObjects(page);
+  for (int i = 0; i < n; ++i) collect_hsegs_obj(FPDFPage_GetObject(page, i), Mat{}, 0, vp, out);
+  return out;
+}
+
+bool name_has(const std::string &name, std::initializer_list<const char *> hints) {
+  for (const char *h : hints)
+    if (name.find(h) != std::string::npos) return true;
+  return false;
+}
+
+size_t trimmed_chars(const std::string &s) {
+  size_t n = 0;
+  for (unsigned char c : s) n += (c & 0xC0) != 0x80 && c != ' ';
+  return n;
+}
+
+void assign_styles(PageText &pt, const std::vector<int> &flags, const std::vector<int> &weight,
+                   const std::vector<HSeg> &segs) {
+  constexpr int kFixedPitch = 1, kItalicFlag = 64, kForceBold = 262144;  // PDF font descriptor flags
+  for (TextItem &it : pt.items) {
+    if (it.font < 0 || it.font >= (int)flags.size()) continue;
+    const std::string &n = pt.fonts[it.font];
+    const int f = flags[it.font];
+    if ((f & kForceBold) || weight[it.font] >= 600 || name_has(n, {"Bold", "Black", "Heavy", "Semibold", "Demibold"}))
+      it.style |= kStyleBold;
+    if ((f & kItalicFlag) || name_has(n, {"Italic", "Oblique"})) it.style |= kStyleItalic;
+    if ((f & kFixedPitch) ||
+        name_has(n, {"Courier", "Mono", "Consolas", "Menlo", "Source Code", "Inconsolata", "Hack", "Fira Code"}))
+      it.style |= kStyleMono;
+  }
+  // Strikethrough: a thin line through the item's middle band covering >= 60% of its width.
+  for (TextItem &it : pt.items) {
+    const RectF &b = it.box;
+    if ((it.style & kStyleMath) || b.w() <= 0 || b.h() <= 0) continue;
+    const float top = b.y0 + 0.20f * b.h(), bot = b.y0 + 0.65f * b.h();
+    for (const HSeg &s : segs) {
+      if (s.y < top || s.y > bot) continue;
+      if (std::max(0.f, std::min(b.x1, s.x1) - std::max(b.x0, s.x0)) >= 0.6f * b.w()) {
+        it.style |= kStyleStrike;
+        break;
+      }
+    }
+  }
+  // Underline: judged per line, the text on it must cover >= 70% of its length (rules and
+  // table borders run on past their text); items it runs under by >= half their width.
+  for (const HSeg &s : segs) {
+    const float len = s.x1 - s.x0;
+    if (len < 2.f || len <= 4.f * std::max(s.h, 0.1f)) continue;
+    std::vector<size_t> on;
+    for (size_t i = 0; i < pt.items.size(); ++i) {
+      const RectF &b = pt.items[i].box;
+      if ((pt.items[i].style & kStyleMath) || b.w() <= 0 || b.h() <= 0) continue;
+      if (s.y >= b.y0 + 0.80f * b.h() && s.y <= b.y1 + std::max(0.25f * b.h(), 2.f) && b.x0 < s.x1 && b.x1 > s.x0)
+        on.push_back(i);
+    }
+    if (on.empty()) continue;
+    std::vector<std::pair<float, float>> sp;
+    for (size_t i : on) sp.push_back({std::max(pt.items[i].box.x0, s.x0), std::min(pt.items[i].box.x1, s.x1)});
+    std::sort(sp.begin(), sp.end());
+    float covered = 0, reach = -1e30f;
+    for (auto [a, c] : sp) {
+      a = std::max(a, reach);
+      if (c > a) covered += c - a;
+      reach = std::max(reach, c);
+    }
+    if (covered < 0.7f * len) continue;
+    for (size_t i : on) {
+      const RectF &b = pt.items[i].box;
+      if (std::max(0.f, std::min(b.x1, s.x1) - std::max(b.x0, s.x0)) >= 0.5f * b.w()) pt.items[i].style |= kStyleUnderline;
+    }
+  }
+  // Superscript / subscript: a short item (<= 6 chars) set clearly smaller than a body item it
+  // hugs on the same line (gap <= half the body height), raised above or dropped below that
+  // item's bottom.
+  for (size_t i = 0; i < pt.items.size(); ++i) {
+    TextItem &it = pt.items[i];
+    const size_t nch = trimmed_chars(it.text);
+    if (nch == 0 || nch > 6 || (it.style & kStyleMath)) continue;
+    const RectF &a = it.box;
+    float body_h = 0, base = 0;
+    for (size_t j = 0; j < pt.items.size(); ++j) {
+      if (j == i || (pt.items[j].style & kStyleMath)) continue;
+      const RectF &b = pt.items[j].box;
+      if (b.h() <= 0 || a.h() > 0.78f * b.h() || trimmed_chars(pt.items[j].text) == 0) continue;
+      if (!(b.y0 < a.y1 && b.y1 > a.y0)) continue;  // same line
+      const float gap = a.x0 >= b.x1 ? a.x0 - b.x1 : b.x0 >= a.x1 ? b.x0 - a.x1 : -1.f;
+      if (gap < -0.5f || gap > 0.5f * b.h()) continue;
+      if (b.h() > body_h) body_h = b.h(), base = b.y1;
+    }
+    if (body_h <= 0) continue;
+    if (a.y1 <= base - 0.2f * body_h) it.style |= kStyleSup;
+    else if (a.y1 >= base + 0.1f * body_h && a.y0 >= base - 0.6f * body_h) it.style |= kStyleSub;
+  }
+}
+
 }  // namespace
 
 PageText extract_page_text(void *doc, int page_index) {
@@ -374,10 +508,12 @@ PageText extract_page_text(void *doc, int page_index) {
   };
   if (tp) glyphs.prescan(tp, n);
   std::unordered_map<std::string, int> font_ids;
+  std::vector<int> font_flags, font_weight;  // per PageText::fonts entry (first object seen)
   TextItem cur;
   std::u32string cur32;
   RectF last{};
   float width_sum = 0;
+  float item_fs = 0, last_ink_bottom = 0;  // effective font size of the item's first char; last glyph's ink bottom
   int font = -1;
   bool pending_space = false, inv = false;
   FPDF_PAGEOBJECT last_obj = nullptr;
@@ -440,7 +576,11 @@ PageText extract_page_text(void *doc, int page_index) {
       const unsigned long len = FPDFText_GetFontInfo(tp, i, fbuf, sizeof fbuf, &flags);
       const std::string name = len > 1 ? std::string(fbuf, std::min<size_t>(len - 1, sizeof fbuf - 1)) : std::string();
       auto [it, added] = font_ids.try_emplace(name, (int)pt.fonts.size());
-      if (added) pt.fonts.push_back(name);
+      if (added) {
+        pt.fonts.push_back(name);
+        font_flags.push_back(flags);
+        font_weight.push_back(FPDFText_GetFontWeight(tp, i));
+      }
       font = it->second;
     }
     if (inv && skip_invisible) continue;
@@ -451,6 +591,21 @@ PageText extract_page_text(void *doc, int page_index) {
     const RectF b = vp.rect(l, bo, r, t);
     if (b.h() < 0.5f) continue;
     if (!cur32.empty() && !pt.lie_spans.empty() && crosses_span(last, b)) flush();
+    // Effective size (font size x text-matrix scale) and the glyph's ink bottom, for the script
+    // split below (liteparse extract.rs size_break).
+    float fs = (float)FPDFText_GetFontSize(tp, i);
+    {
+      FS_MATRIX cm;
+      if (FPDFText_GetMatrix(tp, i, &cm)) fs *= (float)std::sqrt((double)cm.c * cm.c + (double)cm.d * cm.d);
+    }
+    float ink_bottom = b.y1, ink_h = b.h();
+    {
+      double sl, sr, sb, st;
+      if (FPDFText_GetCharBox(tp, i, &sl, &sr, &sb, &st)) {
+        const RectF ink = vp.rect(sl, sb, sr, st);
+        ink_bottom = ink.y1, ink_h = ink.h();
+      }
+    }
 
     if (!cur32.empty()) {
       const float gap = b.x0 - last.x1;
@@ -458,8 +613,12 @@ PageText extract_page_text(void *doc, int page_index) {
       const float avg_w = width_sum / std::max<size_t>(cur32.size(), 1);
       const float char_w = std::max(avg_w, 0.5f * em);
       const bool y_overlap = b.y0 < last.y1 + kYTol && b.y1 > last.y0 - kYTol;
+      // A size step with a baseline shift (into or out of a superscript / subscript run) starts
+      // a new item, so the run can be marked; a size change alone is no script.
+      const bool shifted = std::fabs(ink_bottom - last_ink_bottom) > 0.15f * std::max(cur.box.h(), ink_h);
+      const bool size_break = shifted && item_fs > 0 && fs > 0 && (fs < item_fs * 0.78f || item_fs < fs * 0.78f);
       bool brk = !y_overlap || gap >= kMaxInlineGap || gap < -3 * char_w || font != cur.font ||
-                 b.y0 > last.y1 + kYTol;
+                 b.y0 > last.y1 + kYTol || size_break;
       if (!brk && pending_space && gap > 2.2f * avg_w) brk = true;
       if (brk) {
         flush();
@@ -468,7 +627,7 @@ PageText extract_page_text(void *doc, int page_index) {
         cur32 += U' ';
       }
     }
-    if (cur32.empty()) { cur.box = b; cur.font = font; }
+    if (cur32.empty()) { cur.box = b; cur.font = font; item_fs = fs; }
     else {
       cur.box.x0 = std::min(cur.box.x0, b.x0); cur.box.y0 = std::min(cur.box.y0, b.y0);
       cur.box.x1 = std::max(cur.box.x1, b.x1); cur.box.y1 = std::max(cur.box.y1, b.y1);
@@ -480,9 +639,11 @@ PageText extract_page_text(void *doc, int page_index) {
     pt.recovered += rec != nullptr;
     width_sum += b.w();
     last = b;
+    last_ink_bottom = ink_bottom;
     pending_space = false;
   }
   flush();
+  assign_styles(pt, font_flags, font_weight, collect_hsegs(page, vp));
   if (tp) FPDFText_ClosePage(tp);
   FPDF_ClosePage(page);
   return pt;
@@ -631,7 +792,7 @@ void serialize(const PageText &pt, const Route &rt, std::vector<uint8_t> &out) {
   for (const auto &f : pt.fonts) w.str(f);
   w.pod((uint32_t)pt.items.size());
   for (const auto &it : pt.items) {
-    w.str(it.text); w.pod(it.box); w.pod(it.font); w.pod(it.unusable); w.pod(it.dropped);
+    w.str(it.text); w.pod(it.box); w.pod(it.font); w.pod(it.unusable); w.pod(it.dropped); w.pod(it.style);
   }
 }
 
@@ -651,7 +812,9 @@ bool deserialize(const uint8_t *p, size_t n, PageText &pt, Route &rt) {
   if (!r.pod(k)) return false;
   pt.items.resize(k);
   for (auto &it : pt.items)
-    if (!(r.str(it.text) && r.pod(it.box) && r.pod(it.font) && r.pod(it.unusable) && r.pod(it.dropped))) return false;
+    if (!(r.str(it.text) && r.pod(it.box) && r.pod(it.font) && r.pod(it.unusable) && r.pod(it.dropped) &&
+          r.pod(it.style)))
+      return false;
   return true;
 }
 

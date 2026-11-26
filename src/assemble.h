@@ -6,6 +6,7 @@
 // first page) and formula_number boxes synthesised from "(n)" lines beside
 // display formulas (core/markdown folds those into \tag{n}).
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -17,12 +18,19 @@ class OrderNet;
 
 namespace hp {
 
+// A byte range of a line's text set in one inline style (StyleBit set, text_layer.h).
+struct StyleRun {
+  uint32_t b, e;
+  uint8_t style;
+};
+
 struct PageLine {
   std::string text;
   float x0, y0, x1, y1;  // page px
   float conf = 1.f;
   bool ocr = false;
   bool inline_ocr = false;  // read from pixels at a text-layer box: belongs inside a native line
+  std::vector<StyleRun> styles = {};  // native text only; the Markdown renders them (style_md.h)
 };
 
 struct PageFormula {

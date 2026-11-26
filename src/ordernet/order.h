@@ -54,8 +54,10 @@ std::vector<std::vector<int>> split_blocks(const std::vector<int> &order, const 
 
 // layout_post.page_markdown (keep_furniture, no cells, no table heads, no pictures): blocks
 // rendered by class (## headings, list items, display math lines, geometric tables, paragraphs
-// with hyphenated words joined), furniture blocks dropped unless keep_furniture.
+// with hyphenated words joined), furniture blocks dropped unless keep_furniture. `md`, when given,
+// holds each line's styled Markdown (style_md.h), rendered in place of its plain text outside
+// headings and tables.
 std::string page_markdown(const std::vector<Line> &lines, const std::vector<int> &order, const Heads &h,
-                          bool keep_furniture = false);
+                          bool keep_furniture = false, const std::vector<std::string> *md = nullptr);
 
 }  // namespace hp::on

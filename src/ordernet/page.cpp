@@ -4,6 +4,7 @@
 #include <array>
 #include <string_view>
 
+#include "style_md.h"
 #include "tablenet/text.h"
 
 namespace hp::on {
@@ -152,7 +153,11 @@ PageOrder order_page(OrderNet &net, cudaStream_t stream, int w, int h, const std
     (void)changed;
   }
   const std::vector<int> order = decode_blocks_order(heads, in);
-  std::string md = page_markdown(in, order, heads, /*keep_furniture=*/false);
+  // Styled Markdown for the page's own lines (OrderNet and the grid rebuild saw plain text).
+  std::vector<std::string> styled(in.size());
+  for (int j = 0; j < n; ++j) styled[j] = src[j] >= 0 ? styled_markdown(lines[src[j]]) : in[j].text;
+  std::string md = page_markdown(in, order, heads, /*keep_furniture=*/false, &styled);
+  merge_adjacent_emphasis(md);
   for (const Region &r : regions) {
     if (!r.table) continue;
     const std::string &ph = r.line.text, with = "\n\n" + r.payload + "\n\n";

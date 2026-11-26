@@ -471,12 +471,14 @@ std::string table_html(const std::vector<Box> &boxes, const std::vector<std::str
 
 // _block_part: one block's markdown appended to parts (nothing for dropped furniture).
 void block_part(std::vector<std::string> &parts, const std::vector<int> &blk, const std::vector<Line> &lines,
-                const Heads &h, bool keep_furniture) {
+                const Heads &h, bool keep_furniture, const std::vector<std::string> *md) {
   const int cls = block_class(h, blk);
   if ((cls == kHeader || cls == kFooter) && !keep_furniture) return;
+  // Styled Markdown per line when given (style_md.h); section headings keep plain text (a
+  // uniformly bold heading line is not re-emphasised), and table cells always do.
   std::vector<std::u32string> texts;
   texts.reserve(blk.size());
-  for (int i : blk) texts.push_back(py::utf32(lines[i].text));
+  for (int i : blk) texts.push_back(py::utf32(md && cls != kSection ? (*md)[i] : lines[i].text));
   if (std::all_of(texts.begin(), texts.end(), [](const auto &t) { return whole_math(py::strip(t)); })) {
     // display equations
     std::u32string s;
@@ -756,9 +758,9 @@ std::vector<std::vector<int>> split_blocks(const std::vector<int> &order, const 
 //   Page-Header / Footer  left out unless keep_furniture
 // A block whose lines are all one formula ($...$) becomes display math, one $$...$$ per line.
 std::string page_markdown(const std::vector<Line> &lines, const std::vector<int> &order, const Heads &h,
-                          bool keep_furniture) {
+                          bool keep_furniture, const std::vector<std::string> *md) {
   std::vector<std::string> parts;
-  for (const auto &blk : split_blocks(order, h)) block_part(parts, blk, lines, h, keep_furniture);
+  for (const auto &blk : split_blocks(order, h)) block_part(parts, blk, lines, h, keep_furniture, md);
   std::string out;
   for (const auto &p : parts) {
     if (p.empty()) continue;

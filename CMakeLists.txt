@@ -129,6 +129,7 @@ add_library(hp_core STATIC
   src/multi_resize.cu
   src/dfine_layout.cpp
   src/orient.cpp
+  src/style_md.cpp
   src/text_det.cpp
   src/pdf_render.cpp
   src/render_pool.cpp

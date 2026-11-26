@@ -422,8 +422,10 @@ class DocumentRun {
     const float k = g.px_per_pt();
     for (const auto &q : job.rt.regions) r.ocr_regions.push_back({q.x0 * k, q.y0 * k, q.x1 * k, q.y1 * k});
     for (const auto &it : job.pt.items)
-      if (!it.dropped)
+      if (!it.dropped) {
         job.work.items.push_back({it.text, it.box.x0 * k, it.box.y0 * k, it.box.x1 * k, it.box.y1 * k, 1.f, false});
+        if (it.style) job.work.items.back().styles.push_back({0, static_cast<uint32_t>(it.text.size()), it.style});
+      }
 
     if (!plan.ocr) return;
     const auto t_ocr = Clock::now();

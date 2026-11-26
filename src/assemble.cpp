@@ -7,6 +7,7 @@
 
 #include "core/layout/layout_types.h"
 #include "core/markdown/markdown_export.h"
+#include "style_md.h"
 #include "table_grid.h"
 #include "ordernet/page.h"
 #include "core/pipeline/pipeline_result.h"
@@ -71,7 +72,9 @@ std::vector<PageLine> merge_into_lines(const std::vector<PageLine> &in) {
       const bool same_kind = (l.ocr && !l.inline_ocr) == (it.ocr && !it.inline_ocr);
       if (same_kind && h > 0 && ov >= 0.5f * h && gap > -0.5f * h && gap < 2.5f * h) {
         if (gap > 0.12f * h) l.text += ' ';
+        const auto off = static_cast<uint32_t>(l.text.size());
         l.text += it.text;
+        for (const StyleRun &r : it.styles) l.styles.push_back({r.b + off, r.e + off, r.style});
         l.x0 = std::min(l.x0, it.x0); l.y0 = std::min(l.y0, it.y0);
         l.x1 = std::max(l.x1, it.x1); l.y1 = std::max(l.y1, it.y1);
         l.conf = std::min(l.conf, it.conf);
@@ -146,7 +149,7 @@ AssembledPage assemble_page(int page_index, int w, int h, const std::vector<Layo
   }
   for (const auto &ln : lines) {
     hp::core::OCRResultItem it;
-    it.text = ln.text;
+    it.text = styled_markdown(ln);  // the region renderer's text: styled Markdown (style_md.h)
     it.confidence = ln.conf;
     it.box = quad(ln.x0, ln.y0, ln.x1, ln.y1);
     it.source = ln.ocr ? "" : "pdf";
@@ -216,6 +219,7 @@ AssembledPage assemble_page(int page_index, int w, int h, const std::vector<Layo
   }
   hp::core::pipeline::maybe_assign_reading_order(true, res.results, res.layout, res.reading_order);
   page.markdown = hp::core::markdown::render_markdown(res);
+  merge_adjacent_emphasis(page.markdown);
   page.order = res.reading_order;
   page.lines = std::move(lines);
   return page;

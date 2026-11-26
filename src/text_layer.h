@@ -20,6 +20,13 @@ struct RectF {
   [[nodiscard]] float h() const { return y1 - y0; }
 };
 
+// Inline style of a text item (liteparse SpanStyle; rendered by style_md.h).
+enum StyleBit : uint8_t {
+  kStyleBold = 1, kStyleItalic = 2, kStyleMono = 4, kStyleStrike = 8, kStyleUnderline = 16,
+  kStyleSup = 32, kStyleSub = 64,
+  kStyleMath = 128,  // the item is a TeX math span ("$...$", tex_math): never wrapped in emphasis
+};
+
 struct TextItem {
   std::string text;  // UTF-8
   RectF box;
@@ -27,6 +34,7 @@ struct TextItem {
   int chars = 0, unmapped = 0;
   bool unusable = false;  // liteparse is_unusable_native: unicode-map-error majority or vowel ratio < 10%
   bool dropped = false;   // set by route_page (garbled font / unusable / replaced page)
+  uint8_t style = 0;      // StyleBit set
 };
 
 struct PageText {
