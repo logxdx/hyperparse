@@ -61,7 +61,25 @@ std::vector<LayoutBox> DfineLayout::collect(float score_thresh) const {
     out.push_back(lb);
   }
   std::ranges::sort(out, {}, [](const LayoutBox &b) { return -b.score; });
-  return out;
+  // D-FINE (set prediction, no NMS) now and then returns one object twice: two boxes of the same
+  // class at nearly the same place. A second Table box then gets a geometry grid of the same text
+  // next to LayoutNet's table (the table is emitted twice). Keep the higher-scoring box of each
+  // same-class pair with IoU >= 0.8.
+  auto iou = [](const LayoutBox &a, const LayoutBox &b) {
+    const float ix = std::min(a.x1, b.x1) - std::max(a.x0, b.x0), iy = std::min(a.y1, b.y1) - std::max(a.y0, b.y0);
+    if (ix <= 0 || iy <= 0) return 0.f;
+    const float i = ix * iy;
+    return i / ((a.x1 - a.x0) * (a.y1 - a.y0) + (b.x1 - b.x0) * (b.y1 - b.y0) - i);
+  };
+  std::vector<LayoutBox> kept;
+  kept.reserve(out.size());
+  for (const LayoutBox &b : out) {
+    bool dup = false;
+    for (const LayoutBox &k : kept)
+      if (k.cls == b.cls && iou(k, b) >= 0.8f) { dup = true; break; }
+    if (!dup) kept.push_back(b);
+  }
+  return kept;
 }
 
 }  // namespace hp
