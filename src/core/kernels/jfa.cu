@@ -286,31 +286,53 @@ __device__ __forceinline__ float atomic_max_f(float *addr, float val) {
 
 // Pass A: one thread per expanded-label pixel — axis-aligned bbox (same atomics
 // as jfa_extract_bboxes) plus the integer second-moment accumulation for PCA.
-__global__ void oriented_extract_kernel(
+//
+// Warp-aggregated: a text component covers thousands of pixels, and one global
+// atomic per pixel on its 11 slot words serialised on those few addresses (5.7 ms
+// per 1280-px page on an RTX 4050). The lanes of a warp holding the same label
+// (__match_any_sync) are reduced by the group's lowest lane, which issues one
+// atomic per word. Every quantity is an integer min/max/sum, so the result is
+// bit-identical to the per-pixel version.
+__global__ __launch_bounds__(256) void oriented_extract_kernel(
     const uint32_t *expanded_labels, int w, int h,
     GpuDetBox *bboxes, unsigned long long *mom, int num_slots) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = w * h;
-    if (idx >= total) return;
-    uint32_t label = expanded_labels[idx];
-    if (label == 0) return;
-    int cid = (int)label - 1;
-    if (cid >= num_slots) return;
-    int x = idx % w, y = idx / w;
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = w * h;
+    int cid = -1;
+    if (idx < total) {
+        const uint32_t label = expanded_labels[idx];
+        if (label != 0 && (int)label - 1 < num_slots) cid = (int)label - 1;
+    }
+    const unsigned grp = __match_any_sync(0xffffffffu, cid);  // blockDim is a multiple of 32
+    if (cid < 0) return;
+    const int lane = threadIdx.x & 31;
+    if (lane != __ffs(grp) - 1) return;  // the group's lowest lane reduces it
+    const int warp_idx0 = idx - lane;
+    int xmin = INT_MAX, xmax = INT_MIN, ymin = INT_MAX, ymax = INT_MIN;
+    unsigned long long sx = 0, sy = 0, sxx = 0, syy = 0, sxy = 0;
+    for (unsigned g = grp; g; g &= g - 1) {
+        const int p = warp_idx0 + __ffs(g) - 1;
+        const int x = p % w, y = p / w;
+        xmin = min(xmin, x); xmax = max(xmax, x);
+        ymin = min(ymin, y); ymax = max(ymax, y);
+        // Widen BEFORE multiplying: int x*x overflows at coords >= 46341. Today's
+        // det resize caps coords at 4096, but the cliff would be silent.
+        const unsigned long long ux = (unsigned long long)x, uy = (unsigned long long)y;
+        sx += ux; sy += uy;
+        sxx += ux * ux; syy += uy * uy; sxy += ux * uy;
+    }
+    const int n = __popc(grp);
     GpuDetBox &b = bboxes[cid];
-    atomicMin(&b.xmin, x); atomicMax(&b.xmax, x);
-    atomicMin(&b.ymin, y); atomicMax(&b.ymax, y);
-    atomicAdd(&b.pixel_count, 1);
+    atomicMin(&b.xmin, xmin); atomicMax(&b.xmax, xmax);
+    atomicMin(&b.ymin, ymin); atomicMax(&b.ymax, ymax);
+    atomicAdd(&b.pixel_count, n);
     unsigned long long *m = mom + (size_t)cid * 6;
-    // Widen BEFORE multiplying: int x*x overflows at coords >= 46341. Today's
-    // det resize caps coords at 4096, but the cliff would be silent.
-    const unsigned long long ux = (unsigned long long)x, uy = (unsigned long long)y;
-    atomicAdd(&m[0], 1ULL);
-    atomicAdd(&m[1], ux);
-    atomicAdd(&m[2], uy);
-    atomicAdd(&m[3], ux * ux);
-    atomicAdd(&m[4], uy * uy);
-    atomicAdd(&m[5], ux * uy);
+    atomicAdd(&m[0], (unsigned long long)n);
+    atomicAdd(&m[1], sx);
+    atomicAdd(&m[2], sy);
+    atomicAdd(&m[3], sxx);
+    atomicAdd(&m[4], syy);
+    atomicAdd(&m[5], sxy);
 }
 
 // Pass B (per component): principal-axis angle from the covariance, then seed
@@ -345,25 +367,42 @@ __global__ void oriented_axis_kernel(const unsigned long long *mom,
 }
 
 // Pass C: one thread per expanded-label pixel — project onto the component's
-// oriented basis and track the min/max extent along each axis.
-__global__ void oriented_project_kernel(
+// oriented basis and track the min/max extent along each axis. Warp-aggregated
+// like pass A: each lane computes its own projection, the group's lowest lane
+// takes the min/max over the group (exact: min/max do not depend on order) and
+// issues one CAS update per extent.
+__global__ __launch_bounds__(256) void oriented_project_kernel(
     const uint32_t *expanded_labels, int w, int h,
     const unsigned long long *mom, float *orient, int num_slots) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = w * h;
-    if (idx >= total) return;
-    uint32_t label = expanded_labels[idx];
-    if (label == 0) return;
-    int cid = (int)label - 1;
-    if (cid >= num_slots) return;
-    if (mom[(size_t)cid * 6] < 3) return;
-    int x = idx % w, y = idx / w;
+    __shared__ float s_u[256], s_v[256];
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = w * h;
+    int cid = -1;
+    if (idx < total) {
+        const uint32_t label = expanded_labels[idx];
+        if (label != 0 && (int)label - 1 < num_slots && mom[(size_t)((int)label - 1) * 6] >= 3) cid = (int)label - 1;
+    }
+    const unsigned grp = __match_any_sync(0xffffffffu, cid);  // blockDim is a multiple of 32
+    if (cid < 0) return;
+    const int x = idx % w, y = idx / w;
     float *o = orient + (size_t)cid * 6;
-    float c = o[0], s = o[1];
-    float u = x * c + y * s;
-    float v = -x * s + y * c;
-    atomic_min_f(&o[2], u); atomic_max_f(&o[3], u);
-    atomic_min_f(&o[4], v); atomic_max_f(&o[5], v);
+    const float c = o[0], s = o[1];
+    const float u = x * c + y * s;
+    const float v = -x * s + y * c;
+    s_u[threadIdx.x] = u;
+    s_v[threadIdx.x] = v;
+    __syncwarp(grp);
+    const int lane = threadIdx.x & 31;
+    if (lane != __ffs(grp) - 1) return;
+    const int base = threadIdx.x - lane;
+    float umin = u, umax = u, vmin = v, vmax = v;
+    for (unsigned g = grp & (grp - 1); g; g &= g - 1) {
+        const int t = base + __ffs(g) - 1;
+        umin = fminf(umin, s_u[t]); umax = fmaxf(umax, s_u[t]);
+        vmin = fminf(vmin, s_v[t]); vmax = fmaxf(vmax, s_v[t]);
+    }
+    atomic_min_f(&o[2], umin); atomic_max_f(&o[3], umax);
+    atomic_min_f(&o[4], vmin); atomic_max_f(&o[5], vmax);
 }
 
 // Pass D (per component): reconstruct the 4 oriented-rect corners from the axis
