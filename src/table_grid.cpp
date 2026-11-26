@@ -2,6 +2,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <optional>
+
+#include "table_fix.h"
 
 namespace hp {
 namespace {
@@ -25,14 +28,29 @@ std::string trim(const std::string &s) {
   return s.substr(a, s.find_last_not_of(" \t\r\n") - a + 1);
 }
 
+// Cell text: line breaks become spaces.
+std::string cell_text(const std::string &s) {
+  std::string out;
+  for (char c : s) out += c == '\n' || c == '\r' ? ' ' : c;
+  return trim(out);
+}
+
+// Markdown pipe-table cell: '|' escaped.
 std::string escape_cell(const std::string &s) {
   std::string out;
   for (char c : s) {
     if (c == '|') out += "\\|";
-    else if (c == '\n' || c == '\r') out += ' ';
     else out += c;
   }
-  return trim(out);
+  return out;
+}
+
+tfix::Rect rect_of(const PageLine &s) { return {s.x0, s.y0, s.x1 - s.x0, s.y1 - s.y0}; }
+
+tfix::Rect unite(const tfix::Rect &a, const tfix::Rect &b) {
+  const float x0 = std::min(a.x, b.x), y0 = std::min(a.y, b.y);
+  const float x1 = std::max(a.x + a.width, b.x + b.width), y1 = std::max(a.y + a.height, b.y + b.height);
+  return {x0, y0, x1 - x0, y1 - y0};
 }
 
 // Words of one cell: spans closer than a word gap become one cell candidate.
@@ -54,9 +72,60 @@ std::vector<PageLine> join_words(std::vector<PageLine> spans, float h) {
   return out;
 }
 
+// Cells of one grid row: text and box per column.
+struct Cells {
+  float y0, y1;
+  std::vector<std::string> text;
+  std::vector<std::optional<tfix::Rect>> box;
+  size_t filled = 0;
+};
+
+// Append a wrapped line to a cell: no space after a trailing '-' or '/' ("Co-" + "Pay").
+void append_line(std::string &up, const std::string &t) {
+  if (up.empty()) up = t;
+  else if (up.back() == '-' || up.back() == '/') up += t;
+  else up += ' ' + t;
+}
+
 }  // namespace
 
-std::string table_markdown(std::vector<PageLine> spans) {
+bool stack_header_lines(std::vector<std::vector<std::string>> &text, std::vector<std::vector<std::optional<tfix::Rect>>> *box,
+                        const std::vector<std::pair<float, float>> &band, float h) {
+  size_t b = 0;
+  while (b < text.size() &&
+         std::none_of(text[b].begin(), text[b].end(), [](const std::string &t) { return tfix::is_value(t); }))
+    ++b;
+  // a line repeating a body cell's text in the same column is a data row without a number (a
+  // listing's first record: "Common Stock | KO | New York Stock Exchange"), not header text
+  for (size_t i = 1; i < b; ++i) {
+    bool repeats = false;
+    for (size_t k = 0; k < text[i].size() && !repeats; ++k)
+      for (size_t j = b; j < text.size() && !repeats; ++j)
+        repeats = !text[i][k].empty() && text[i][k] == text[j][k];
+    if (repeats) {
+      b = i;
+      break;
+    }
+  }
+  if (b < 2 || b > kMaxHeaderLines || b >= text.size()) return false;
+  for (size_t i = 1; i < b; ++i)
+    if (band[i].first - band[i - 1].second >= 0.6f * h) return false;
+  for (size_t i = 1; i < b; ++i)
+    for (size_t k = 0; k < text[0].size(); ++k) {
+      if (text[i][k].empty()) continue;
+      append_line(text[0][k], text[i][k]);
+      if (box) {
+        auto &hb = (*box)[0][k];
+        const auto &ib = (*box)[i][k];
+        if (ib) hb = hb ? unite(*hb, *ib) : ib;
+      }
+    }
+  text.erase(text.begin() + 1, text.begin() + static_cast<std::ptrdiff_t>(b));
+  if (box) box->erase(box->begin() + 1, box->begin() + static_cast<std::ptrdiff_t>(b));
+  return true;
+}
+
+std::string table_markdown(std::vector<PageLine> spans, const GridOptions &opt) {
   spans.erase(std::remove_if(spans.begin(), spans.end(),
                              [](const PageLine &s) { return trim(s.text).empty() || height(s) <= 0; }),
               spans.end());
@@ -115,18 +184,15 @@ std::string table_markdown(std::vector<PageLine> spans) {
   };
 
   // ── cells, with wrapped-cell rows folded into the row above ──
-  struct Cells {
-    float y0, y1;
-    std::vector<std::string> text;
-    size_t filled = 0;
-  };
   std::vector<Cells> grid;
   for (const auto &r : rows) {
-    Cells c{r.y0, r.y1, std::vector<std::string>(ncols), 0};
+    Cells c{r.y0, r.y1, std::vector<std::string>(ncols), std::vector<std::optional<tfix::Rect>>(ncols), 0};
     for (const auto &s : r.spans) {
-      std::string &t = c.text[col_of(s)];
+      const size_t k = col_of(s);
+      std::string &t = c.text[k];
       if (!t.empty()) t += ' ';
-      t += escape_cell(s.text);
+      t += cell_text(s.text);
+      c.box[k] = c.box[k] ? unite(*c.box[k], rect_of(s)) : rect_of(s);
     }
     for (const auto &t : c.text) c.filled += !t.empty();
     if (!grid.empty()) {
@@ -135,7 +201,10 @@ std::string table_markdown(std::vector<PageLine> spans) {
       for (size_t k = 0; k < ncols && subset; ++k) subset = c.text[k].empty() || !p.text[k].empty();
       if (subset && c.y0 - p.y1 < 0.6f * h) {
         for (size_t k = 0; k < ncols; ++k)
-          if (!c.text[k].empty()) p.text[k] += ' ' + c.text[k];
+          if (!c.text[k].empty()) {
+            p.text[k] += ' ' + c.text[k];
+            p.box[k] = unite(*p.box[k], *c.box[k]);
+          }
         p.y1 = c.y1;
         continue;
       }
@@ -147,25 +216,47 @@ std::string table_markdown(std::vector<PageLine> spans) {
   for (size_t k = 0; k < ncols; ++k)
     if (std::any_of(grid.begin(), grid.end(), [k](const Cells &c) { return !c.text[k].empty(); })) used.push_back(k);
   if (used.size() < 2) return "";
-  for (auto &c : grid) {
-    std::vector<std::string> t;
-    for (size_t k : used) t.push_back(std::move(c.text[k]));
-    c.text = std::move(t);
-  }
-  const size_t kept = used.size();
   size_t multi = 0;
   for (const auto &c : grid) multi += c.filled >= 2;
   if (grid.size() < 2 || 2 * multi < grid.size()) return "";
+  std::vector<std::vector<std::string>> text;
+  std::vector<std::vector<std::optional<tfix::Rect>>> box;
+  std::vector<std::pair<float, float>> band;
+  for (auto &c : grid) {
+    std::vector<std::string> t;
+    std::vector<std::optional<tfix::Rect>> b;
+    for (size_t k : used) t.push_back(std::move(c.text[k])), b.push_back(c.box[k]);
+    text.push_back(std::move(t));
+    box.push_back(std::move(b));
+    band.push_back({c.y0, c.y1});
+  }
+  return write_grid(std::move(text), std::move(box), band, h, opt);
+}
+
+std::string write_grid(std::vector<std::vector<std::string>> text, std::vector<std::vector<std::optional<tfix::Rect>>> box,
+                       const std::vector<std::pair<float, float>> &band, float h, const GridOptions &opt) {
+  // ── a header wrapped over several rows becomes one row, then the table clean-up (table_fix.h)
+  // on a plain table whose first row is the header, as liteparse fixes its heuristic tables ──
+  if (opt.stack_header) stack_header_lines(text, &box, band, h);
+  tfix::SpanTable t;
+  t.header_rows = 1;
+  for (size_t r = 0; r < text.size(); ++r) {
+    std::vector<tfix::SpanCell> row;
+    for (size_t k = 0; k < text[r].size(); ++k) row.push_back({std::move(text[r][k]), 1, 1, box[r][k]});
+    t.rows.push_back(std::move(row));
+  }
+  if (opt.clean_up) tfix::fix_plain(t);
+  if (!tfix::is_plain(t) || t.rows.empty()) return tfix::to_html(t);
 
   // ── Markdown ──
-  auto line = [&](const std::vector<std::string> &cells) {
+  auto line = [&](const std::vector<tfix::SpanCell> &cells) {
     std::string s = "|";
-    for (const auto &t : cells) s += ' ' + t + " |";
+    for (const auto &c : cells) s += ' ' + escape_cell(c.text) + " |";
     return s + '\n';
   };
-  std::string md = line(grid[0].text);
-  md += line(std::vector<std::string>(kept, "---"));
-  for (size_t i = 1; i < grid.size(); ++i) md += line(grid[i].text);
+  std::string md = line(t.rows[0]);
+  md += line(std::vector<tfix::SpanCell>(t.rows[0].size(), tfix::SpanCell{"---", 1, 1, std::nullopt}));
+  for (size_t i = 1; i < t.rows.size(); ++i) md += line(t.rows[i]);
   md.pop_back();
   return md;
 }

@@ -137,6 +137,7 @@ add_library(hp_core STATIC
   src/text_layer.cpp
   src/assemble.cpp
   src/table_grid.cpp
+  src/table_fix.cpp
   src/tablenet/text.cpp
   src/tablenet/decode.cpp
   src/tablenet/units.cpp
@@ -165,7 +166,7 @@ add_library(hp_core STATIC
 target_include_directories(hp_core PUBLIC ${CMAKE_SOURCE_DIR}/src)
 # LayoutNet's features and decoder must round like the Rust reference (tests/tablenet_parity):
 # no fused multiply-adds.
-set_source_files_properties(src/tablenet/text.cpp src/tablenet/decode.cpp src/tablenet/units.cpp
+set_source_files_properties(src/table_fix.cpp src/tablenet/text.cpp src/tablenet/decode.cpp src/tablenet/units.cpp
   src/tablenet/features.cpp src/tablenet/page.cpp src/ordernet/order.cpp src/ordernet/text.cpp
   PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
 # The TeX math pass (LiteParse tex_math port) compares f32 sums against thresholds like the Rust reference.
@@ -199,6 +200,11 @@ set_target_properties(formula_golden_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR}
 add_executable(render_pool_test tests/render_pool_test.cpp)
 target_link_libraries(render_pool_test PRIVATE hp_core)
 set_target_properties(render_pool_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
+add_executable(table_fix_test tests/table_fix_test.cpp)
+target_link_libraries(table_fix_test PRIVATE hp_core)
+target_compile_options(table_fix_test PRIVATE -O2 -Wall -Wextra)
+set_target_properties(table_fix_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
 add_executable(tablenet_decode_test tests/tablenet_decode_test.cpp)
 target_link_libraries(tablenet_decode_test PRIVATE hp_core)

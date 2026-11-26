@@ -8,6 +8,7 @@
 #include "core/layout/layout_types.h"
 #include "core/markdown/markdown_export.h"
 #include "style_md.h"
+#include "table_fix.h"
 #include "table_grid.h"
 #include "ordernet/page.h"
 #include "core/pipeline/pipeline_result.h"
@@ -191,7 +192,22 @@ AssembledPage assemble_page(int page_index, int w, int h, const std::vector<Layo
     if (!by_region[i].empty()) {
       auto &v = by_region[i];
       std::stable_sort(v.begin(), v.end(), [](const ModelTable *a, const ModelTable *b) { return a->y0 < b->y0; });
-      for (const ModelTable *mt : v) pt.html += (pt.html.empty() ? "" : "\n") + mt->html;
+      // The region's spans (page points) for each table's header band (table_fix.h): a header row
+      // LayoutNet left out of the table but D-FINE put in the region joins the table instead of
+      // being lost. Spans inside a model table's box are that table's.
+      const float k = v[0]->px_per_pt;
+      std::vector<tfix::BandSpan> spans;
+      std::vector<char> taken;
+      for (const auto &it : items) {
+        if (!center_in(it, layout_in[i])) continue;
+        spans.push_back({it.text, it.x0 / k, it.y0 / k, (it.x1 - it.x0) / k, (it.y1 - it.y0) / k});
+        const float cx = 0.5f * (it.x0 + it.x1), cy = 0.5f * (it.y0 + it.y1);
+        taken.push_back(std::any_of(model_tables.begin(), model_tables.end(), [&](const ModelTable &m) {
+          return m.x0 - k <= cx && cx <= m.x1 + k && m.y0 - k <= cy && cy <= m.y1 + k;
+        }));
+      }
+      for (const ModelTable *mt : v)
+        pt.html += (pt.html.empty() ? "" : "\n") + tfix::model_table_html(mt->grid, spans, taken);
       t.html = pt.html;
     } else {
       std::vector<PageLine> spans;

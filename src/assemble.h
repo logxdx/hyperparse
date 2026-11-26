@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "dfine_layout.h"
+#include "tablenet/decode.h"
 
 namespace hp::on {
 class OrderNet;
@@ -45,10 +46,13 @@ struct PageTable {
   std::string html;      // LayoutNet's table(s) in this region (colspan / rowspan, <th> header rows)
 };
 
-// A table LayoutNet found on the page: its box (page px) and HTML.
+// A table LayoutNet found on the page: its box (page px) and grid (page points, as decoded).
+// assemble_page writes it as HTML after the clean-up (table_fix.h), with the header band printed
+// just above it in its Table region.
 struct ModelTable {
   float x0, y0, x1, y1;
-  std::string html;
+  tn::Grid grid;
+  float px_per_pt = 1.f;
 };
 
 struct AssembledPage {

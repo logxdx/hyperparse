@@ -234,10 +234,10 @@ class AssemblyStage {
           const auto tt = Clock::now();
           const float k = r.dpi / 72.f;
           const tn::PageInput in = table_input(w);
-          for (const tn::Table &t : tn::run_page(models_.tablenet(), in, models_.table_stream()))
+          for (tn::Table &t : tn::run_page(models_.tablenet(), in, models_.table_stream()))
             model_tables.push_back({static_cast<float>(t.bbox[0]) * k, static_cast<float>(t.bbox[1]) * k,
                                     static_cast<float>(t.bbox[2]) * k, static_cast<float>(t.bbox[3]) * k,
-                                    t.grid.to_html()});
+                                    std::move(t.grid), k});
           table_ms += ms_since(tt);
           ++table_pages;
           model_table_count += static_cast<int>(model_tables.size());
