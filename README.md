@@ -20,10 +20,16 @@ doesn't already have good text, and no Python on the hot path.
   headings, lists), around D-FINE's tables and formulas; `--no-ordernet` falls back to XY-cut
 - **Precision**: LayoutNet and OrderNet run as FP16 TensorRT engines (`--tables-precision` /
   `--order-precision int8` for INT8); see `tools/quant`
-- **Text**: the PDF's own text layer when it is usable, OCR where it isn't (per page or per region)
-- **Formulas**: display formulas as LaTeX
+- **Text**: the PDF's own text layer when it is usable, OCR where it isn't (per page or per region);
+  scans turned sideways or upside down are turned upright first (PP-LCNet page orientation)
+- **Inline styles**: bold, italic, code, strikethrough, underline and super- / subscripts from the
+  text layer, as Markdown
+- **Formulas**: display formulas as LaTeX; inline math in TeX-made PDFs as `$...$`, read from the
+  PDF's glyphs (a port of liteparse's tex_math)
 - **Tables**: table structure from LayoutNet (rows, columns, spanning cells, header rows) as HTML
-  inside the Markdown; `--no-tables` falls back to pipe tables built from the text's geometry
+  inside the Markdown, cleaned up as liteparse does (currency symbols onto their numbers, wrapped
+  rows folded, group headers spanned, header bands above the table joined); `--no-tables` falls
+  back to pipe tables built from the text's geometry
 - **Markdown**: per page and for the whole document
 - **CLI**: `hyperparse doc.pdf --md doc.md --out pages.jsonl`
 - **HTTP server**: `hyperparse_server`, with a queue, streaming (NDJSON), Prometheus metrics,
@@ -44,6 +50,43 @@ idle timeout and reload on the next request in about 0.6 s. Full numbers:
 ## Benchmarks
 
 All on one RTX 4050 Laptop GPU (6 GB, sm89), TensorRT 11.5, 8 page workers, November 2026.
+
+### Document-parsing benchmarks (full sets)
+
+The five public benchmarks of LlamaIndex's
+[OCRia-nano-1 report](https://www.llamaindex.ai/ocria/ocria-nano-1-report.pdf), each with its official
+scorer, run at 250 dpi. ParseBench and OmniParseBench keep running headers / footers (their ground
+truth has them; hp's page-header / page-footer text is put back around the page Markdown), olmOCR-bench
+and BHL drop them (hp's default). The other columns are the report's numbers (CPU parsers, 16 vCPUs);
+LiteParse + OCRia-nano-1 run here through the same harnesses reproduced them (ParseBench-1 52.7,
+OmniParseBench 74.8, ParseBench-2 59.3).
+
+| Benchmark | hp | LiteParse + OCRia-nano-1 | Indra 1.1.2 | Marker (fast) | LiteParse (Tesseract) |
+|---|---|---|---|---|---|
+| [ParseBench-2](https://huggingface.co/datasets/llamaindex/ParseBench-2) (4,317 pages) | **61.7** | 59.2 | 55.1 | 52.5 | 48.7 |
+| [OmniParseBench](https://github.com/datalab-to/omni_parse_bench) v1.7 (2,937 pages) | **76.8** | 74.8 | 70.9 | 69.8 | 42.3 |
+| [ParseBench-1](https://huggingface.co/datasets/llamaindex/ParseBench) (2,079 docs) | **56.5** | 52.7 | 42.6 | 40.4 | 40.5 |
+| [olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench) (1,403 PDFs) | **65.0** | 60.9 | 60.8 | 60.8 | 45.7 |
+| [BHL IMPACT](https://huggingface.co/datasets/finebooks/bhl-impact-gt) CER, lower is better (2,165 pages) | 0.085 | **0.048** | 0.062 | 0.067 | 0.275 |
+
+ParseBench-2 by dimension: text 70.3, formatting 81.2, tables 60.9, charts 5.0, layout 82.1, forms 70.4
+(LiteParse + OCRia-nano-1: 68.5 / 82.2 / 59.5 / 3.1 / 72.4 / 69.8). OmniParseBench: text 64.9, tables
+73.4, layout 92.1. olmOCR-bench: arXiv math 61.9, multi-column 74.1, tables 75.4, headers / footers 94.6,
+long tiny text 76.2, old scans 26.2, old-scan math 17.9. hp has no chart model (charts stay figures) and
+its OCR is weakest on handwriting and historical print. GPU / cloud VLM parsers score 79–87 on
+ParseBench-2 (OCRia-1, Reducto, Datalab, Chandra 2).
+
+What moved these numbers, from the previous build (ParseBench-2 / ParseBench-1 / OmniParseBench /
+olmOCR-bench): 59.5 / 51.9 / 70.9 / 60.1 before; D-FINE duplicate boxes dropped (a duplicate Table box
+wrote its table twice); scans turned upright (OmniParseBench rotated pages 61 → 78.5); inline styles
+(ParseBench formatting 75.3 → 81.2, 36.6 → 53.5); TeX math from the PDF's glyphs (olmOCR arXiv math
+18 → 62); table clean-up and header bands (ParseBench tables 57.2 → 60.9, 63.2 → 68.9).
+
+Throughput through these harnesses (about one page per request, 4 requests in flight): 9–10 pages/s;
+engine time 81 ms per page; a saturated server about 20 pages/s.
+
+### Stage choices
+
 "Before" is hp with XY-cut reading order and geometry-only tables (`--no-ordernet --no-tables`).
 
 ### Accuracy

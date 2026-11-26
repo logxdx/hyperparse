@@ -308,7 +308,9 @@ bool snapshot_covers(const fs::path &snap, ModelNeeds needs) {
     return false;
   };
   for (const PlanSpec &s : plan_specs())
-    if (needed(s, needs) && !s.optional && !listed(s.onnx)) return false;
+    // An optional model (doc_ori.onnx) counts too when online, so a snapshot cached before it was
+    // added is fetched again; offline, such a snapshot runs without it.
+    if (needed(s, needs) && (!s.optional || env("HF_HUB_OFFLINE") != "1") && !listed(s.onnx)) return false;
   for (const ModelAsset &a : model_assets())
     if (needed(a.group, needs) && !listed(a.path)) return false;
   return true;
