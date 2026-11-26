@@ -35,6 +35,11 @@ struct TextItem {
   bool unusable = false;  // liteparse is_unusable_native: unicode-map-error majority or vowel ratio < 10%
   bool dropped = false;   // set by route_page (garbled font / unusable / replaced page)
   uint8_t style = 0;      // StyleBit set
+  // A run split off its host by a size step alone (script split): the host's vertical band, which
+  // the item's box takes once styles are assigned, so line building keeps it on its line.
+  // Text-layer internal, not serialised.
+  bool has_band = false;
+  float band_y0 = 0, band_y1 = 0;
 };
 
 struct PageText {

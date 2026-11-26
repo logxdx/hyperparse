@@ -16,6 +16,7 @@
 #include <fpdfview.h>
 
 #include "glyph_decoder.h"
+#include "tex_math/tex_math.h"
 
 namespace hp {
 namespace {
@@ -507,6 +508,22 @@ PageText extract_page_text(void *doc, int page_index) {
     return false;
   };
   if (tp) glyphs.prescan(tp, n);
+  // TeX math (tex_math.h): LaTeX from the glyphs of born-digital TeX pages. The glyphs a span
+  // replaces end the current item and are skipped (liteparse treats them like hidden chars); the
+  // span becomes one "$tex$" item, placed in the item sequence where its first glyph was.
+  std::vector<tex::MathSpan> math;
+  std::vector<char> consumed;
+  if (tp) {
+    math = tex::page_math(page, tp);
+    if (!math.empty()) {
+      consumed.assign(static_cast<size_t>(n), 0);
+      for (const auto &m : math)
+        for (int c : m.chars)
+          if (c >= 0 && c < n) consumed[static_cast<size_t>(c)] = 1;
+    }
+  }
+  std::vector<int> item_first;  // per pt.items entry: pdfium index of its first char
+  int cur_first = 0;
   std::unordered_map<std::string, int> font_ids;
   std::vector<int> font_flags, font_weight;  // per PageText::fonts entry (first object seen)
   TextItem cur;
@@ -514,6 +531,8 @@ PageText extract_page_text(void *doc, int page_index) {
   RectF last{};
   float width_sum = 0;
   float item_fs = 0, last_ink_bottom = 0;  // effective font size of the item's first char; last glyph's ink bottom
+  bool next_band = false;                   // the next run is a script split: it takes next_y0..next_y1
+  float next_y0 = 0, next_y1 = 0;
   int font = -1;
   bool pending_space = false, inv = false;
   FPDF_PAGEOBJECT last_obj = nullptr;
@@ -530,14 +549,20 @@ PageText extract_page_text(void *doc, int page_index) {
         pt.unmapped_chars += cur.unmapped;
         pt.nonspace_chars += cur.chars;
         pt.items.push_back(std::move(cur));
+        item_first.push_back(cur_first);
       }
     }
     cur = TextItem{};
     cur32.clear();
     width_sum = 0;
+    next_band = false;
   };
 
   for (int i = 0; i < n; ++i) {
+    if (!consumed.empty() && consumed[static_cast<size_t>(i)]) {
+      flush();
+      continue;
+    }
     char32_t u = FPDFText_GetUnicode(tp, i);
     if (u >= 0xD800 && u <= 0xDBFF && i + 1 < n) {  // surrogate pair
       const unsigned lo = FPDFText_GetUnicode(tp, i + 1);
@@ -617,17 +642,26 @@ PageText extract_page_text(void *doc, int page_index) {
       // a new item, so the run can be marked; a size change alone is no script.
       const bool shifted = std::fabs(ink_bottom - last_ink_bottom) > 0.15f * std::max(cur.box.h(), ink_h);
       const bool size_break = shifted && item_fs > 0 && fs > 0 && (fs < item_fs * 0.78f || item_fs < fs * 0.78f);
-      bool brk = !y_overlap || gap >= kMaxInlineGap || gap < -3 * char_w || font != cur.font ||
-                 b.y0 > last.y1 + kYTol || size_break;
+      const bool other = !y_overlap || gap >= kMaxInlineGap || gap < -3 * char_w || font != cur.font ||
+                         b.y0 > last.y1 + kYTol;
+      bool brk = other || size_break;
       if (!brk && pending_space && gap > 2.2f * avg_w) brk = true;
       if (brk) {
+        // Split by the size step alone: the new run keeps its host's band (liteparse script_geom).
+        const bool keep_band = size_break && !other;
+        const float h0 = cur.has_band ? cur.band_y0 : cur.box.y0, h1 = cur.has_band ? cur.band_y1 : cur.box.y1;
         flush();
+        if (keep_band) next_band = true, next_y0 = h0, next_y1 = h1;
       } else if (pending_space || (gap > 0.35f * em && is_alnum(cur32.back()) && is_alnum(lig ? (char32_t)(unsigned char)lig[0] : u))) {
         cur.text += ' ';
         cur32 += U' ';
       }
     }
-    if (cur32.empty()) { cur.box = b; cur.font = font; item_fs = fs; }
+    if (cur32.empty()) {
+      cur.box = b; cur.font = font; item_fs = fs; cur_first = i;
+      if (next_band) cur.has_band = true, cur.band_y0 = next_y0, cur.band_y1 = next_y1;
+      next_band = false;
+    }
     else {
       cur.box.x0 = std::min(cur.box.x0, b.x0); cur.box.y0 = std::min(cur.box.y0, b.y0);
       cur.box.x1 = std::max(cur.box.x1, b.x1); cur.box.y1 = std::max(cur.box.y1, b.y1);
@@ -643,7 +677,27 @@ PageText extract_page_text(void *doc, int page_index) {
     pending_space = false;
   }
   flush();
+  if (!math.empty()) {
+    // Splice the math items into the item sequence by first glyph (merge_into_lines joins items
+    // in sequence order, so a span must sit between the words it was set between).
+    std::vector<std::pair<int, TextItem>> seq;
+    seq.reserve(pt.items.size() + math.size());
+    for (size_t k = 0; k < pt.items.size(); ++k) seq.emplace_back(item_first[k], std::move(pt.items[k]));
+    for (const auto &m : math) {
+      TextItem it;
+      it.text = "$" + m.tex + "$";
+      it.box = {m.x0, m.top, m.x1, m.bottom};
+      it.chars = static_cast<int>(m.chars.size());
+      it.style = kStyleMath;
+      seq.emplace_back(m.chars.empty() ? n : m.chars.front(), std::move(it));
+    }
+    std::stable_sort(seq.begin(), seq.end(), [](const auto &a, const auto &b) { return a.first < b.first; });
+    pt.items.clear();
+    for (auto &[k, it] : seq) pt.items.push_back(std::move(it));
+  }
   assign_styles(pt, font_flags, font_weight, collect_hsegs(page, vp));
+  for (TextItem &it : pt.items)
+    if (it.has_band) it.box.y0 = std::min(it.box.y0, it.band_y0), it.box.y1 = std::max(it.box.y1, it.band_y1);
   if (tp) FPDFText_ClosePage(tp);
   FPDF_ClosePage(page);
   return pt;
@@ -662,6 +716,7 @@ Route route_page(PageText &pt) {
   Acc page;
   std::map<int, Acc> per_font;
   for (const auto &it : pt.items) {
+    if (it.style & kStyleMath) continue;  // LaTeX ("$\\mathbb{N}$"), not text: no garbled-text evidence
     const std::u32string t = decode_utf8(it.text);
     const bool sym = it.font >= 0 && is_symbol_font(pt.fonts[it.font]);
     Acc a;

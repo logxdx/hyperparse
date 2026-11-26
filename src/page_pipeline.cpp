@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -103,11 +104,32 @@ tn::PageInput table_input(PageWork &w) {
 
 // Copy every display-formula crop out of the page slot so the slot can be reused
 // while the formulas wait for the assembly thread.
+// Whether a Formula box's text layer is TeX math (tex_math.h): most of the bytes of the native
+// lines centred in it are $...$ spans. Experiment (HP_TEXMATH_FORMULA=1): such boxes keep their
+// lines (rendered as display math) instead of going to the formula model.
+bool texmath_formula(const PageWork &pw, const LayoutBox &b) {
+  static const bool on = [] {
+    const char *v = std::getenv("HP_TEXMATH_FORMULA");
+    return v && *v == '1';
+  }();
+  if (!on) return false;
+  size_t total = 0, math = 0;
+  for (const PageLine &l : pw.items) {
+    const float cx = 0.5f * (l.x0 + l.x1), cy = 0.5f * (l.y0 + l.y1);
+    if (l.ocr || cx < b.x0 || cx > b.x1 || cy < b.y0 || cy > b.y1) continue;
+    total += l.text.size();
+    for (const StyleRun &r : l.styles)
+      if (r.style & kStyleMath) math += r.e - r.b;
+  }
+  return math > 0 && math * 2 >= total;
+}
+
 void copy_formula_crops(const uint8_t *page, int w, int h, PageWork &pw) {
   const auto &boxes = pw.result.layout;
   for (size_t i = 0; i < boxes.size(); ++i) {
     const auto &b = boxes[i];
     if (kDfineLabels[b.cls] != "Formula") continue;
+    if (texmath_formula(pw, b)) continue;
     const int x0 = std::clamp(static_cast<int>(b.x0), 0, w - 1), y0 = std::clamp(static_cast<int>(b.y0), 0, h - 1);
     const int x1 = std::clamp(static_cast<int>(std::ceil(b.x1)), x0 + 1, w);
     const int y1 = std::clamp(static_cast<int>(std::ceil(b.y1)), y0 + 1, h);
