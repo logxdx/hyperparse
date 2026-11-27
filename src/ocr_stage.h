@@ -39,13 +39,32 @@ struct OcrPageResult {
   std::vector<PageLine> lines;
   int det_boxes = 0, rec_boxes = 0, direct_rec_boxes = 0;
   double canvas_px = 0;      // region det canvas area
-  double det_ms = 0, rec_ms = 0;
+  double det_ms = 0, rec_ms = 0;  // GPU-thread time in the det and rec phases (launch + wait)
+};
+
+// One page's OCR, run in three phases on models.ocr_stream() so that the GPU
+// thread can overlap them with other pages (page_pipeline.cpp):
+//   launch_det   after the page's resize launch: det queued behind `lane.resized`;
+//   launch_rec   waits for det, filters the boxes, queues rec on the page buffer;
+//   finish_ocr   waits for rec, decodes, applies the confidence filter.
+// det and rec each have one set of buffers: a page's launch_rec must come before
+// the next page's launch_det input is written (its resize launch), and its
+// finish_ocr before the next page's launch_rec. The lane's page buffer must stay
+// untouched until finish_ocr.
+struct OcrJob {
+  OcrPlan plan;
+  PageGeometry g;
+  const uint8_t *page = nullptr;  // lane page buffer (u8 BGR)
+  std::vector<hp::core::Box> keep;  // boxes sent to rec: detected first, then text-layer-guided
+  size_t n_detected = 0;
+  OcrPageResult out;
 };
 
 [[nodiscard]] OcrPlan plan_ocr(ModelSet &models, const Route &rt, const PageGeometry &g, bool ocr_enabled);
 
-// Runs on models.ocr_stream(), after `lane.resized`. Synchronizes the OCR stream.
-[[nodiscard]] OcrPageResult run_ocr(ModelSet &models, LayoutLane &lane, const OcrPlan &plan, const PageText &pt,
-                                    const Route &rt, const PageGeometry &g);
+void launch_det(ModelSet &models, LayoutLane &lane, OcrJob &job);
+void launch_rec(ModelSet &models, OcrJob &job, const PageText &pt, const Route &rt);
+// Returns the page's OCR result (moved out of `job`).
+[[nodiscard]] OcrPageResult finish_ocr(ModelSet &models, OcrJob &job);
 
 }  // namespace hp

@@ -73,8 +73,8 @@ bool plan_region_det(const Route &rt, const PageGeometry &g, const TextDet &det,
          static_cast<double>(pack.canvas_w) * pack.canvas_h < kMaxPackedShare * full_w * full_h;
 }
 
-// Det on the packed canvas; boxes mapped back to page px.
-std::vector<hp::core::Box> detect_regions(ModelSet &m, LayoutLane &lane, const RegionPack &pack, const PageGeometry &g) {
+// Det on the packed canvas: write the canvas and queue det (no wait).
+void launch_region_det(ModelSet &m, LayoutLane &lane, const RegionPack &pack, const PageGeometry &g) {
   TextDet &det = m.det();
   const cudaStream_t s = m.ocr_stream();
   float *in = det.canvas_input(pack.canvas_w, pack.canvas_h);
@@ -86,9 +86,14 @@ std::vector<hp::core::Box> detect_regions(ModelSet &m, LayoutLane &lane, const R
     crops.add_det_region(r.x, r.y, r.w, r.h, static_cast<float>(r.pw) / r.w, in, pack.canvas_w, pack.canvas_h, r.ox,
                          r.oy, pw, ph);
   crops.launch(lane.page.get(), static_cast<size_t>(g.w) * 3, g.w, g.h, s);
+  det.enqueue(s);
+}
 
+// Canvas boxes of a region det mapped back to page px.
+std::vector<hp::core::Box> region_boxes_to_page(const std::vector<hp::core::Box> &canvas_boxes, const RegionPack &pack,
+                                                const PageGeometry &g) {
   std::vector<hp::core::Box> boxes;
-  for (const auto &q : det.run(s)) {
+  for (const auto &q : canvas_boxes) {
     float cx = 0, cy = 0;
     for (int k = 0; k < 4; ++k) {
       cx += q[k][0] * 0.25f;
@@ -116,19 +121,26 @@ OcrPlan plan_ocr(ModelSet &models, const Route &rt, const PageGeometry &g, bool 
   return p;
 }
 
-OcrPageResult run_ocr(ModelSet &m, LayoutLane &lane, const OcrPlan &plan, const PageText &pt, const Route &rt,
-                      const PageGeometry &g) {
-  OcrPageResult out;
-  const auto t_det = Clock::now();
+void launch_det(ModelSet &m, LayoutLane &lane, OcrJob &job) {
+  const auto t = Clock::now();
+  job.page = lane.page.get();
   CUDA_CHECK(cudaStreamWaitEvent(m.ocr_stream(), lane.resized));
-  std::vector<hp::core::Box> boxes;
-  if (plan.region_det) {
-    boxes = detect_regions(m, lane, plan.pack, g);
-    out.canvas_px = static_cast<double>(plan.pack.canvas_w) * plan.pack.canvas_h;
-  } else if (plan.need_det) {
-    boxes = m.det().run(m.ocr_stream());
+  if (job.plan.region_det) {
+    launch_region_det(m, lane, job.plan.pack, job.g);
+    job.out.canvas_px = static_cast<double>(job.plan.pack.canvas_w) * job.plan.pack.canvas_h;
+  } else if (job.plan.need_det) {
+    m.det().enqueue(m.ocr_stream());
   }
-  out.det_boxes = static_cast<int>(boxes.size());
+  job.out.det_ms += ms_since(t);
+}
+
+void launch_rec(ModelSet &m, OcrJob &job, const PageText &pt, const Route &rt) {
+  const auto t_det = Clock::now();
+  const PageGeometry &g = job.g;
+  std::vector<hp::core::Box> boxes;
+  if (job.plan.region_det) boxes = region_boxes_to_page(m.det().collect(), job.plan.pack, g);
+  else if (job.plan.need_det) boxes = m.det().collect();
+  job.out.det_boxes = static_cast<int>(boxes.size());
   // Box order is left as det emits it. That order is run-dependent: the core
   // CCL/JFA postprocess compacts with atomics, and boxes also jitter by 1-2 px.
   // So two parses of mix100.pdf differ on about half the pages, with run-to-run
@@ -137,7 +149,8 @@ OcrPageResult run_ocr(ModelSet &m, LayoutLane &lane, const OcrPlan &plan, const 
   // scans from 0.8944 to 0.8925 (merge/batching order), so it is not done.
 
   const float px = g.px_per_pt();
-  std::vector<hp::core::Box> keep;
+  std::vector<hp::core::Box> &keep = job.keep;
+  keep.clear();
   for (const auto &b : boxes) {
     const auto bb = hp::core::aabb(b);
     const RectF r{bb[0] / px, bb[1] / px, bb[2] / px, bb[3] / px};
@@ -145,7 +158,7 @@ OcrPageResult run_ocr(ModelSet &m, LayoutLane &lane, const OcrPlan &plan, const 
     if (rt.keep_native && overlaps_native(pt, r)) continue;
     keep.push_back(b);
   }
-  const size_t n_detected = keep.size();
+  job.n_detected = keep.size();
   // Text-layer-guided rec: unusable native items, read from pixels at their own
   // box. Padding is vertical only; horizontal neighbours are native text.
   for (const auto &r : rt.rec_boxes) {
@@ -156,28 +169,39 @@ OcrPageResult run_ocr(ModelSet &m, LayoutLane &lane, const OcrPlan &plan, const 
     const int y1 = std::clamp(static_cast<int>(r.y1 * px) + pad, 0, g.h - 1);
     if (x1 - x0 >= 3 && y1 - y0 >= 3) keep.push_back(hp::core::Box{{{{x0, y0}, {x1, y0}, {x1, y1}, {x0, y1}}}});
   }
-  out.direct_rec_boxes = static_cast<int>(rt.rec_boxes.size());
-  out.rec_boxes = static_cast<int>(keep.size());
-  out.det_ms = std::chrono::duration<double, std::milli>(Clock::now() - t_det).count();
+  job.out.direct_rec_boxes = static_cast<int>(rt.rec_boxes.size());
+  job.out.rec_boxes = static_cast<int>(keep.size());
+  job.out.det_ms += ms_since(t_det);
 
   const auto t_rec = Clock::now();
-  const hp::core::GpuImage img{lane.page.get(), static_cast<size_t>(g.w) * 3, g.h, g.w};
-  std::vector<std::pair<std::string, float>> texts;
-  if (n_detected < keep.size() && non_cjk_page(pt)) {
-    const std::vector<hp::core::Box> detected(keep.begin(), keep.begin() + static_cast<long>(n_detected));
-    const std::vector<hp::core::Box> guided(keep.begin() + static_cast<long>(n_detected), keep.end());
-    if (!detected.empty()) texts = m.rec().run(img, detected, m.ocr_stream(), false);
-    const auto g = m.rec().run(img, guided, m.ocr_stream(), true);
-    texts.insert(texts.end(), g.begin(), g.end());
+  const hp::core::GpuImage img{const_cast<uint8_t *>(job.page), static_cast<size_t>(g.w) * 3, g.h, g.w};
+  // Detected lines and text-layer-guided reads are batched apart (the guided ones
+  // without the CJK classes on a non-CJK page), in one enqueue.
+  std::vector<hp::core::Box> detected, guided;
+  std::vector<RecGroup> groups;
+  if (job.n_detected < keep.size() && non_cjk_page(pt)) {
+    detected.assign(keep.begin(), keep.begin() + static_cast<long>(job.n_detected));
+    guided.assign(keep.begin() + static_cast<long>(job.n_detected), keep.end());
+    if (!detected.empty()) groups.push_back({&detected, false});
+    groups.push_back({&guided, true});
   } else {
-    texts = m.rec().run(img, keep, m.ocr_stream(), false);
+    groups.push_back({&keep, false});
   }
-  out.rec_ms = ms_since(t_rec);
+  m.rec().enqueue(img, groups, m.ocr_stream());
+  job.out.rec_ms += ms_since(t_rec);
+}
 
+OcrPageResult finish_ocr(ModelSet &m, OcrJob &job) {
+  const auto t_rec = Clock::now();
+  const std::vector<std::pair<std::string, float>> texts = m.rec().collect();
+  OcrPageResult out = std::move(job.out);
+  out.rec_ms += ms_since(t_rec);
+
+  const std::vector<hp::core::Box> &keep = job.keep;
   static const bool debug = std::getenv("HP_DEBUG_REC") != nullptr;  // dump text-layer-guided reads
   for (size_t i = 0; i < keep.size(); ++i) {
     const auto bb = hp::core::aabb(keep[i]);
-    const bool direct = i >= n_detected;
+    const bool direct = i >= job.n_detected;
     if (debug && direct)
       std::fprintf(stderr, "[rec] %d,%d %dx%d conf %.2f '%s'\n", bb[0], bb[1], bb[2] - bb[0], bb[3] - bb[1],
                    texts[i].second, texts[i].first.c_str());

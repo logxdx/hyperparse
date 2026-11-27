@@ -101,7 +101,7 @@ struct ParseStats {
   // Sums over pages (divide by pages or OCR pages for means).
   double text_ms = 0, render_ms = 0;          // in the page workers
   double layout_wait_ms = 0;                   // GPU thread waiting on a lane
-  double ocr_ms = 0, det_ms = 0, rec_ms = 0;   // GPU thread, OCR pages only
+  double ocr_ms = 0, det_ms = 0, rec_ms = 0;   // GPU thread time in the OCR phases (launch + wait), OCR pages only
   double assemble_ms = 0;
 
   int formulas = 0, formula_batches = 0, formula_steps = 0;

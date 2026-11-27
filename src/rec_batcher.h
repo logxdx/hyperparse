@@ -18,6 +18,7 @@
 #include <cuda_runtime.h>
 
 #include "crop_batch.h"
+#include "cuda_raii.h"
 #include "text_recognizer.h"
 #include "core/common/cuda/cuda_ptr.h"
 #include "core/common/geometry/box.h"
@@ -31,9 +32,12 @@ class RecBatcher final : public TextRecognizer {
   static constexpr int kH = 48, kMaxBatch = 32, kColumnBudget = 8192, kMaxW = 4000;
 
   bool load(const std::string &plan, const std::string &dict);
-  [[nodiscard]] std::vector<std::pair<std::string, float>> run(const hp::core::GpuImage &img,
-                                                               const std::vector<hp::core::Box> &boxes,
-                                                               cudaStream_t stream, bool no_cjk) override;
+  [[nodiscard]] Texts run(const hp::core::GpuImage &img, const std::vector<hp::core::Box> &boxes, cudaStream_t stream,
+                          bool no_cjk) override;
+  // Crops, every batch, argmax and the D2H of the class ids are queued; the CTC
+  // decode waits for collect().
+  void enqueue(const hp::core::GpuImage &img, std::span<const RecGroup> groups, cudaStream_t stream) override;
+  [[nodiscard]] Texts collect() override;
   int batches_run = 0, lines_run = 0;
 
  private:
@@ -47,6 +51,18 @@ class RecBatcher final : public TextRecognizer {
   hp::core::CudaHostPtr<float> h_score_;
   hp::core::CudaHostPtr<int> h_idx_;
   size_t in_cap_ = 0, rows_cap_ = 0;
+
+  // The enqueued work, for collect(). Batch lines [beg, end) index slot_out_.
+  struct Batch {
+    int beg, end, W;
+    size_t in_off, row_off;
+    int T;
+    bool no_cjk;
+  };
+  std::vector<Batch> bs_;
+  std::vector<int> slot_out_;  // packed line -> output index
+  int n_out_ = 0;
+  CudaEvent done_;
 };
 
 }  // namespace hp

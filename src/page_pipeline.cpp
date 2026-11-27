@@ -5,6 +5,8 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -301,9 +303,13 @@ class DocumentRun {
         LaneJob &job = lanes_[next_lane_];
         if (job.busy) finish(next_lane_);
         start(next_lane_, d);
+        if (LaneJob &prev = lanes_[next_lane_ ^ 1]; prev.rec_pending) complete_ocr(prev);
+        if (job.det_pending) queue_rec(job);
         next_lane_ ^= 1;
         if (assembly.failed()) throw std::runtime_error("assembly failed");  // replaced by its own error below
       }
+      for (auto &lane : lanes_)
+        if (lane.rec_pending) complete_ocr(lane);
       for (int i = 0; i < ModelSet::kLanes; ++i)
         if (lanes_[i].busy) finish(i);
     } catch (...) {
@@ -341,6 +347,9 @@ class DocumentRun {
     Route rt;
     PageWork work;
     Clock::time_point t0;
+    OcrJob ocr;
+    bool det_pending = false;  // det queued, rec not yet
+    bool rec_pending = false;  // rec queued, not yet collected
   };
 
   // Ignore duplicates and stale results. The supervisor may report a crashed
@@ -375,7 +384,16 @@ class DocumentRun {
     assembly_->push(std::move(w));
   }
 
-  // Upload, resize, layout, OCR. Layout stays in flight on the lane stream.
+  // Upload, resize, layout, and the OCR det launch. Layout stays in flight on the
+  // lane stream, det on the OCR stream.
+  //
+  // OCR is pipelined across pages (ocr_stage.h): the main loop queues page i's
+  // det here, then collects page i-1's rec (decoding it on the host while page
+  // i's det runs), then queues page i's rec. The OCR stream so always holds the
+  // next piece of work, and page i+1's upload, resize and layout run beside page
+  // i's rec. Det and rec each have one set of buffers, which this order
+  // respects: page i's det is collected before page i+1's resize writes the det
+  // input, and page i-1's rec is collected before page i's rec is queued.
   void start(int lane_index, const RenderPool::Done &d) {
     LaneJob &job = lanes_[lane_index];
     LayoutLane &lane = m_.lane(lane_index);
@@ -398,7 +416,8 @@ class DocumentRun {
     job.work.w0 = d.w, job.work.h0 = d.h;
     if (m_.has_orient() && job.rt.kind == kFullOcr && job.rt.rec_boxes.empty() &&
         std::none_of(job.pt.items.begin(), job.pt.items.end(), [](const TextItem &it) { return !it.dropped; })) {
-      const OrientResult o = m_.orient().classify(pool_.pixels(d.slot), d.w, d.h, m_.ocr_stream());
+      // On the lane stream: the OCR stream may still hold the previous page's rec.
+      const OrientResult o = m_.orient().classify(pool_.pixels(d.slot), d.w, d.h, lane.stream);
       if (o.degrees_cw != 0 && o.conf >= kOrientMinConf) {
         rotate_upright_bgr(pool_.pixels(d.slot), job.done.w, job.done.h, o.degrees_cw);
         job.work.rot = o.degrees_cw;
@@ -435,21 +454,48 @@ class DocumentRun {
       }
 
     if (!plan.ocr) return;
-    const auto t_ocr = Clock::now();
-    OcrPageResult ocr = run_ocr(m_, lane, plan, job.pt, job.rt, g);
-    stats_.ocr_ms += ms_since(t_ocr);
+    job.ocr.plan = plan;
+    job.ocr.g = g;
+    launch_det(m_, lane, job.ocr);
+    job.det_pending = true;
+  }
+
+  // Wait for the page's det, filter the boxes, queue its rec.
+  void queue_rec(LaneJob &job) {
+    launch_rec(m_, job.ocr, job.pt, job.rt);
+    job.det_pending = false;
+    job.rec_pending = true;
+  }
+
+  // Wait for the page's rec and add its OCR lines to the page.
+  void complete_ocr(LaneJob &job) {
+    const bool region_det = job.ocr.plan.region_det;
+    OcrPageResult ocr = finish_ocr(m_, job.ocr);
+    job.rec_pending = false;
+    stats_.ocr_ms += ocr.det_ms + ocr.rec_ms;
     stats_.det_ms += ocr.det_ms;
     stats_.rec_ms += ocr.rec_ms;
     stats_.det_boxes += ocr.det_boxes;
     stats_.rec_boxes += ocr.rec_boxes;
     stats_.direct_rec_boxes += ocr.direct_rec_boxes;
-    if (plan.region_det) {
+    if (region_det) {
       ++stats_.region_det_pages;
       stats_.region_det_canvas_px += ocr.canvas_px;
     }
+    PageResult &r = job.work.result;
     r.det_boxes = ocr.det_boxes;
     r.rec_boxes = ocr.rec_boxes;
-    r.region_det = plan.region_det;
+    r.region_det = region_det;
+    // Debug: every OCR line as recognised (before line merging), one per row:
+    // page, box (page px), confidence, text. For A/B checks of the OCR stage.
+    static FILE *const dump = [] {
+      const char *p = std::getenv("HP_DUMP_OCR");
+      return p ? std::fopen(p, "w") : nullptr;
+    }();
+    if (dump)
+      for (const PageLine &l : ocr.lines)
+        std::fprintf(dump, "%d\t%.0f\t%.0f\t%.0f\t%.0f\t%.3f\t%s\n", r.page, l.x0, l.y0, l.x1, l.y1, l.conf,
+                     l.text.c_str());
     for (auto &l : ocr.lines) job.work.items.push_back(std::move(l));
   }
 
@@ -458,6 +504,13 @@ class DocumentRun {
   void finish(int lane_index) {
     LaneJob &job = lanes_[lane_index];
     LayoutLane &lane = m_.lane(lane_index);
+    // The main loop has always completed this page's OCR by now; kept for safety
+    // (the other lane's rec first: rec has one set of buffers).
+    if (job.det_pending) {
+      if (LaneJob &other = lanes_[lane_index ^ 1]; other.rec_pending) complete_ocr(other);
+      queue_rec(job);
+    }
+    if (job.rec_pending) complete_ocr(job);
     const auto t_wait = Clock::now();
     lane.stream.sync();
     stats_.layout_wait_ms += ms_since(t_wait);
