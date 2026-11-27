@@ -13,6 +13,16 @@ namespace hp {
 class CudaStream {
  public:
   CudaStream() { CUDA_CHECK(cudaStreamCreateWithFlags(&s_, cudaStreamNonBlocking)); }
+  explicit CudaStream(int priority) {
+    CUDA_CHECK(cudaStreamCreateWithPriority(&s_, cudaStreamNonBlocking, priority));
+  }
+  // The highest priority the device offers: when the GPU is full, blocks of its
+  // kernels are scheduled ahead of those of default-priority streams.
+  static CudaStream high_priority() {
+    int least = 0, greatest = 0;
+    CUDA_CHECK(cudaDeviceGetStreamPriorityRange(&least, &greatest));
+    return CudaStream(greatest);
+  }
   ~CudaStream() {
     if (s_) cudaStreamDestroy(s_);
   }

@@ -7,7 +7,7 @@
 //
 // Layout runs on two lanes, each with its own D-FINE context and stream, so
 // page i+1's upload, resize and layout overlap page i's OCR on the shared OCR
-// stream. Formula decoding gets its own stream on the assembly thread.
+// stream. Formula decoding gets its own stream on the formula thread.
 
 #include <array>
 #include <memory>
@@ -62,7 +62,7 @@ struct LayoutLane {
   DfineLayout layout;
   hp::core::CudaPtr<uint8_t> page;  // current page, u8 BGR
   size_t page_cap = 0;
-  CudaStream stream;
+  CudaStream stream = CudaStream::high_priority();  // see ModelSet::ocr_stream_
   CudaEvent resized;  // multi_resize done: the OCR stream may read the det input
 
   // Grow the page buffer to hold `bytes` (never shrinks while loaded).
@@ -111,7 +111,11 @@ class ModelSet {
   ModelLoadTimes load_times_;
   // Streams first: members are destroyed in reverse order, so the streams outlive
   // every engine and buffer that may still have work queued on them.
-  CudaStream ocr_stream_, formula_stream_, table_stream_;
+  // The page path (layout lanes, OCR) runs at high priority, formulas, LayoutNet
+  // and OrderNet at the default: a formula cohort is long (many decode steps) and
+  // would otherwise slow every page in the pipeline behind it.
+  CudaStream ocr_stream_ = CudaStream::high_priority();
+  CudaStream formula_stream_, table_stream_;
   std::array<std::unique_ptr<LayoutLane>, kLanes> lanes_;
   std::unique_ptr<TextDet> det_;
   CropBatch det_crops_;
