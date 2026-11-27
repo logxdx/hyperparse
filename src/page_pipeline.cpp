@@ -32,6 +32,7 @@
 #include "tablenet/text.h"
 #include "tablenet/units.h"
 #include "core/common/cuda/cuda_check.h"
+#include "core/common/cuda/cuda_ptr.h"
 
 namespace hp {
 namespace {
@@ -791,8 +792,7 @@ class PagePipeline::Impl {
     w.result.ok = true;
     const bool live = !doc.failed.load();
     if (live && doc.formulas) copy_formula_crops(pool_.pixels(job.done.slot), job.done.w, job.done.h, w);
-    if (live && doc.job_opt.tables && has_table_region(w.result.layout))
-      w.grey = tn::grey_from_bgr(pool_.pixels(job.done.slot), job.done.w, job.done.h, static_cast<size_t>(job.done.w) * 3);
+    if (live && doc.job_opt.tables && has_table_region(w.result.layout)) w.grey = grey_page(lane_index, job.done.w, job.done.h);
     w.result.ms.gpu = ms_since(job.t0);
     job.busy = false;
     free_slots_.push_back(job.done.slot);
@@ -882,6 +882,21 @@ class PagePipeline::Impl {
     } catch (...) {
       for (PageWork &w : batch) fail(*w.doc, std::current_exception());  // every page here has crops
     }
+  }
+
+  // The lane's page in grey, for LayoutNet (rules and image branch). Converted on
+  // the GPU from the page already there: on the host (tn::grey_from_bgr, same
+  // weights) it took 2-3 ms of the GPU thread's time per table page.
+  std::vector<uint8_t> grey_page(int lane_index, int w, int h) {
+    LayoutLane &lane = m_.lane(lane_index);
+    const size_t n = static_cast<size_t>(w) * h;
+    hp::core::CudaPtr<uint8_t> &d = grey_dev_[lane_index];
+    if (grey_cap_[lane_index] < n) d.reset(grey_cap_[lane_index] = n);
+    launch_bgr_to_grey(lane.page.get(), static_cast<size_t>(w) * 3, w, h, d.get(), lane.stream);
+    std::vector<uint8_t> g(n);
+    CUDA_CHECK(cudaMemcpyAsync(g.data(), d.get(), n, cudaMemcpyDeviceToHost, lane.stream));
+    lane.stream.sync();
+    return g;
   }
 
   // ── assembly threads ──────────────────────────────────────────────────────
@@ -1002,6 +1017,8 @@ class PagePipeline::Impl {
   bool pool_dead_ = false;
   std::array<LaneJob, ModelSet::kLanes> lanes_;
   int next_lane_ = 0;
+  std::array<hp::core::CudaPtr<uint8_t>, ModelSet::kLanes> grey_dev_;  // grey_page()
+  std::array<size_t, ModelSet::kLanes> grey_cap_{};
   std::vector<Ready> ready_;  // rendered pages waiting for the GPU (start_next)
   uint64_t slot_turns_ = 0, gpu_turns_ = 0;
 

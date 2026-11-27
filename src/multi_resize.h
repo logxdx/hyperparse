@@ -33,6 +33,10 @@ struct ResizeTable {
 void launch_multi_resize(const uint8_t *src, size_t step, int sw, int sh,
                          const ResizeTable &table, cudaStream_t stream);
 
+// u8 BGR page -> u8 grey (w*h, packed), the same integer weights as
+// tn::grey_from_bgr (bit-identical).
+void launch_bgr_to_grey(const uint8_t *src, size_t step, int w, int h, uint8_t *dst, cudaStream_t stream);
+
 // ── Specs (the geometry each model was evaluated with) ──────────────────────
 
 // D-FINE: ratio = S/max(w,h), int() truncation, centred pad, fill 114, RGB, /255.

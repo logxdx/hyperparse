@@ -107,4 +107,24 @@ ResizeOut doc_ori_spec(int w, int h, float *dst) {
   return o;
 }
 
+// ── grey ────────────────────────────────────────────────────────────────────
+
+namespace {
+
+__global__ void bgr_to_grey_kernel(const uint8_t *src, size_t step, int w, int h, uint8_t *dst) {
+  const int x = blockIdx.x * blockDim.x + threadIdx.x, y = blockIdx.y;
+  if (x >= w || y >= h) return;
+  const uint8_t *p = src + static_cast<size_t>(y) * step + static_cast<size_t>(x) * 3;
+  dst[static_cast<size_t>(y) * w + x] =
+      static_cast<uint8_t>((4899u * p[0] + 9617u * p[1] + 1868u * p[2] + (1u << 13)) >> 14);
+}
+
+}  // namespace
+
+void launch_bgr_to_grey(const uint8_t *src, size_t step, int w, int h, uint8_t *dst, cudaStream_t stream) {
+  const dim3 block(256), grid((w + 255) / 256, h);
+  bgr_to_grey_kernel<<<grid, block, 0, stream>>>(src, step, w, h, dst);
+  CUDA_CHECK(cudaGetLastError());
+}
+
 }  // namespace hp

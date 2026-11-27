@@ -9,7 +9,8 @@
 //   GPU thread                    per page of any document, alternating two LayoutLanes:
 //        │                          H2D upload -> multi_resize -> D-FINE (lane stream)
 //        │                          OCR stage on the OCR stream (ocr_stage.h)
-//        │                          lane sync -> copy formula crops -> slot freed
+//        │                          lane sync -> copy formula crops, grey page for
+//        │                          LayoutNet (converted on the GPU) -> slot freed
 //        │  PageWork (queue), pages with formula crops first through:
 //   formula thread                formula decode, batched across queued pages (of
 //        │                        any document)
