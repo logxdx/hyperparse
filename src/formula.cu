@@ -249,7 +249,20 @@ bool FormulaRecognizer::load(const std::string &dir) {
   d_pos_ = hp::core::CudaPtr<int64_t>(MAXIT);
   CUDA_CHECK(cudaMemcpy(d_pos_.get(), pos.data(), MAXIT * sizeof(int64_t), cudaMemcpyHostToDevice));
   return enc_->set_input_shape("x", dims({1, 1, kFormulaS, kFormulaS})) && step_->set_input_shape("pos", dims({1})) &&
-         set_prep_batch(B) && set_step_batch(B);
+         set_prep_batch(B) && set_step_batch(B, MAXLEN) && init_len_buckets();
+}
+
+// A plan that takes the KV at a shorter length (engine_build.cpp: padded to 1056 slots inside the
+// graph, so the attention and its tokens are unchanged) only moves the slots in use across the
+// graph boundary: the step at position p passes the smallest bucket >= p + 3.
+bool FormulaRecognizer::init_len_buckets() {
+  len_buckets_.clear();
+  const char *e = std::getenv("HP_FORMULA_FULL_KV");  // debug: always all 1056 slots
+  if (!(e && *e == '1') && step_->set_input_shape("kb", dims({2, B, H, 64, Dh})))
+    len_buckets_ = {64, 128, 256, 512};
+  len_buckets_.push_back(MAXLEN);
+  step_len_ = 0;
+  return set_step_batch(B, MAXLEN);
 }
 
 // Prep / step at batch nb: kBatch, or 1 for a crop decoded alone (see formula.h). The next
@@ -260,11 +273,12 @@ bool FormulaRecognizer::set_prep_batch(int nb) {
   return prep_->set_input_shape("memory", dims({nb, CTX, MEMD}));
 }
 
-bool FormulaRecognizer::set_step_batch(int nb) {
-  if (nb == step_batch_) return true;
+bool FormulaRecognizer::set_step_batch(int nb, int len) {
+  if (nb == step_batch_ && len == step_len_) return true;
   step_batch_ = nb;
-  return step_->set_input_shape("tokens", dims({nb, 3})) && step_->set_input_shape("kb", dims({2, nb, H, MAXLEN, Dh})) &&
-         step_->set_input_shape("vb", dims({2, nb, H, MAXLEN, Dh})) &&
+  step_len_ = len;
+  return step_->set_input_shape("tokens", dims({nb, 3})) && step_->set_input_shape("kb", dims({2, nb, H, len, Dh})) &&
+         step_->set_input_shape("vb", dims({2, nb, H, len, Dh})) &&
          step_->set_input_shape("ck", dims({2, nb, H, CTX, Dh})) && step_->set_input_shape("cv", dims({2, nb, H, CTX, Dh}));
 }
 
@@ -319,7 +333,7 @@ void FormulaRecognizer::decode_cohort(int n, int set, std::vector<std::vector<in
     Rows rows;
     [[nodiscard]] int live() const { return (int)std::count_if(rows.r, rows.r + B, [](int r) { return r >= 0; }); }
   };
-  auto kv = [&](int buf) { return d_kv_.get() + (size_t)buf * 2 * kKv; };  // v at + kKv
+  auto kv = [&](int buf) { return d_kv_.get() + (size_t)buf * 2 * kKv; };  // v at + kKv; [2, nb, H, len, Dh]
   auto ckv = [&](int slot) { return d_ckv_.get() + (size_t)(set * G + slot) * 2 * kCkv; };  // cv at + kCkv
   auto tok = [&](int slot) { return d_tok_.get() + (size_t)slot * B * 3; };
   volatile int *done = h_eos_.get();
@@ -327,7 +341,9 @@ void FormulaRecognizer::decode_cohort(int n, int set, std::vector<std::vector<in
 
   CUDA_CHECK(cudaStreamWaitEvent(s, set_ready_[set]));
   const int nb = n == 1 ? 1 : B;  // step batch size
-  if (!set_step_batch(nb)) throw std::runtime_error("formula step shape");
+  size_t li = 0;                  // KV length bucket
+  int len = len_buckets_[li];
+  if (!set_step_batch(nb, len)) throw std::runtime_error("formula step shape");
   std::vector<Group> gs;
   std::vector<int> spare;  // KV buffers no group holds
   for (int g = 0; g < G + 1; ++g) {
@@ -340,11 +356,12 @@ void FormulaRecognizer::decode_cohort(int n, int set, std::vector<std::vector<in
   }
   // Row a of group `from` -> empty slot b of group `to`: everything its next step reads.
   auto move = [&](Group &from, int a, Group &to, int b) {
+    const size_t row = (size_t)H * len * Dh;
     for (int l = 0; l < 2; ++l) {
       const size_t sk = (size_t)(l * B + a), dk = (size_t)(l * B + b);
       for (size_t off : {size_t{0}, kKv})
-        CUDA_CHECK(cudaMemcpyAsync(kv(to.kv) + off + dk * kKvRow, kv(from.kv) + off + sk * kKvRow,
-                                   kKvRow * sizeof(float), cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMemcpyAsync(kv(to.kv) + off + dk * row, kv(from.kv) + off + sk * row, row * sizeof(float),
+                                   cudaMemcpyDeviceToDevice, s));
       for (size_t off : {size_t{0}, kCkv})
         CUDA_CHECK(cudaMemcpyAsync(ckv(to.slot) + off + dk * kCkvRow, ckv(from.slot) + off + sk * kCkvRow,
                                    kCkvRow * sizeof(float), cudaMemcpyDeviceToDevice, s));
@@ -380,6 +397,24 @@ void FormulaRecognizer::decode_cohort(int n, int set, std::vector<std::vector<in
         gs.erase(src);
       }
       if (gs.empty()) break;
+    }
+    if (3 * it + 3 > len) {  // the next length bucket: re-lay each group's KV out at the longer stride
+      while (3 * it + 3 > len_buckets_[li]) ++li;
+      const int to = len_buckets_[li];
+      for (Group &g : gs) {
+        const int out = spare.back();
+        spare.pop_back();
+        for (size_t off : {size_t{0}, kKv}) {
+          CUDA_CHECK(cudaMemsetAsync(kv(out) + off, 0, (size_t)2 * nb * H * to * Dh * sizeof(float), s));
+          CUDA_CHECK(cudaMemcpy2DAsync(kv(out) + off, (size_t)to * Dh * sizeof(float), kv(g.kv) + off,
+                                       (size_t)len * Dh * sizeof(float), (size_t)len * Dh * sizeof(float),
+                                       (size_t)2 * nb * H, cudaMemcpyDeviceToDevice, s));
+        }
+        spare.push_back(g.kv);
+        g.kv = out;
+      }
+      len = to;
+      if (!set_step_batch(nb, len)) throw std::runtime_error("formula step shape");
     }
     for (Group &g : gs) {
       const int out = spare.back();

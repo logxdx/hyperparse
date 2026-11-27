@@ -398,6 +398,11 @@ std::string plan_source_key(const PlanSpec &s, const fs::path &onnx_dir) {
   std::string key = sha + " ws=" + std::to_string(s.workspace_gb) + (s.logits_output ? " logits" : "");
   if (s.host_shapes) key += " host_shapes";
   for (const std::string &sc : s.fp16_scopes) key += " fp16:" + sc;
+  if (!s.len_inputs.empty()) {
+    key += " len_axis=" + std::to_string(s.len_axis) + ":";
+    for (const std::string &n : s.len_inputs) key += n + ",";
+    for (const std::string &n : s.len_outputs) key += n + ",";
+  }
   for (const Profile &p : s.profiles) {
     key += " |";
     for (const InputRange &r : p) {

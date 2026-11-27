@@ -39,6 +39,10 @@ struct PlanSpec {
   // engine_build.cpp). For a mixed-precision ONNX whose autocast left BatchNorm and affine ops in
   // FP32 between FP16 convs.
   std::vector<std::string> fp16_scopes = {};
+  // Inputs and outputs whose axis `len_axis` the ONNX fixes but the plan takes at any length up
+  // to it (padded / cut inside the graph): engine_build.cpp.
+  std::vector<std::string> len_inputs = {}, len_outputs = {};
+  int len_axis = 0;
 };
 
 // PP-OCR rec plans: the default column-budget recogniser loads the logits plan (profile 0 only);

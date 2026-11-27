@@ -71,10 +71,12 @@ class FormulaRecognizer {
                      const std::vector<FormulaCrop> &crops, const std::vector<int> &order, EncodeJob &next);
 
   bool set_prep_batch(int nb);
-  bool set_step_batch(int nb);
+  bool set_step_batch(int nb, int len);
+  bool init_len_buckets();
 
   std::unique_ptr<hp::core::engine::TrtEngine> enc_, prep_, step_;
-  int prep_batch_ = 0, step_batch_ = 0;  // the batches prep_ and step_ are shaped for
+  int prep_batch_ = 0, step_batch_ = 0, step_len_ = 0;  // the shapes prep_ and step_ are set to
+  std::vector<int> len_buckets_;  // KV lengths the step runs at (just 1056 for a fixed-length plan)
   std::optional<hp::core::formula::FormulaTokenizer> tok_;
   std::string enc_out_;
   CudaStream enc_stream_;

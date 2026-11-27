@@ -4,6 +4,7 @@
 #include <NvOnnxParser.h>
 
 #include <chrono>
+#include <deque>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -162,6 +163,65 @@ void fold_shape_scatters(nvinfer1::INetworkDefinition &net) {
   }
 }
 
+// The ONNX fixes axis `axis` of the named inputs and outputs (the formula step's 1056 KV slots).
+// The plan takes them at any length up to that: inputs are zero-padded to the full length inside
+// the graph and outputs cut back to the inputs' length. Every other layer keeps the ONNX shapes,
+// so TensorRT keeps its kernels (attention reduces over the same 1056 slots: same tokens), while
+// the copies at the graph boundary scale with the length passed in. (Attending over only the
+// slots passed is faster still, but changes the softmax / PV reduction order: 3 to 10 of the 321
+// arxiv100 formulas flip, for any length below 1056 tried, 1024 included.)
+void pad_length_axis(nvinfer1::INetworkDefinition &net, const std::vector<std::string> &ins,
+                     const std::vector<std::string> &outs, int axis, const std::string &plan) {
+  static const int64_t kZero[nvinfer1::Dims::MAX_DIMS] = {}, kOne[nvinfer1::Dims::MAX_DIMS] = {1, 1, 1, 1, 1, 1, 1, 1};
+  static std::deque<int64_t> full_store;  // constant weights must outlive the build
+  auto dims1 = [](int64_t v) { nvinfer1::Dims d{}; d.nbDims = 1; d.d[0] = v; return d; };
+  auto all = [](int n, const int64_t *v) { nvinfer1::Dims d{}; d.nbDims = n; for (int j = 0; j < n; ++j) d.d[j] = v[j]; return d; };
+  nvinfer1::ITensor *ref_shape = nullptr;
+  int n = 0;
+  for (const std::string &name : ins) {
+    nvinfer1::ITensor *t = nullptr;
+    for (int i = 0; i < net.getNbInputs(); ++i)
+      if (name == net.getInput(i)->getName()) t = net.getInput(i);
+    if (!t) throw std::runtime_error(plan + ": no input " + name);
+    nvinfer1::Dims d = t->getDimensions();
+    n = d.nbDims;
+    if (axis >= n || d.d[axis] <= 0) throw std::runtime_error(plan + ": " + name + " has no fixed length axis");
+    full_store.push_back(d.d[axis]);
+    d.d[axis] = -1;
+    t->setDimensions(d);
+    nvinfer1::IShapeLayer *shape_layer = net.addShape(*t);
+    nvinfer1::ITensor *shape = shape_layer->getOutput(0);
+    if (!ref_shape) ref_shape = shape;
+    std::vector<nvinfer1::ITensor *> parts;  // shape with the axis set back to the full length
+    if (axis > 0) parts.push_back(net.addSlice(*shape, dims1(0), dims1(axis), dims1(1))->getOutput(0));
+    parts.push_back(net.addConstant(dims1(1), nvinfer1::Weights{nvinfer1::DataType::kINT64, &full_store.back(), 1})->getOutput(0));
+    if (axis + 1 < n) parts.push_back(net.addSlice(*shape, dims1(axis + 1), dims1(n - axis - 1), dims1(1))->getOutput(0));
+    nvinfer1::IConcatenationLayer *size = net.addConcatenation(parts.data(), static_cast<int32_t>(parts.size()));
+    size->setAxis(0);
+    nvinfer1::ISliceLayer *pad = net.addSlice(*t, all(n, kZero), all(n, kOne), all(n, kOne));
+    pad->setInput(2, *size->getOutput(0));
+    pad->setMode(nvinfer1::SampleMode::kFILL);  // fill value 0
+    for (int l = 0; l < net.getNbLayers(); ++l) {
+      nvinfer1::ILayer *user = net.getLayer(l);
+      if (user == pad || user == shape_layer) continue;
+      for (int i = 0; i < user->getNbInputs(); ++i)
+        if (user->getInput(i) == t) user->setInput(i, *pad->getOutput(0));
+    }
+  }
+  for (const std::string &name : outs) {
+    nvinfer1::ITensor *o = nullptr;
+    for (int i = 0; i < net.getNbOutputs(); ++i)
+      if (name == net.getOutput(i)->getName()) o = net.getOutput(i);
+    if (!o || !ref_shape || o->getDimensions().nbDims != n) throw std::runtime_error(plan + ": no output " + name);
+    nvinfer1::ISliceLayer *cut = net.addSlice(*o, all(n, kZero), all(n, kOne), all(n, kOne));
+    cut->setInput(2, *ref_shape);
+    net.unmarkOutput(*o);
+    o->setName((name + "_full").c_str());
+    cut->getOutput(0)->setName(name.c_str());
+    net.markOutput(*cut->getOutput(0));
+  }
+}
+
 std::vector<PlanSpec> make_specs() {
   std::vector<PlanSpec> s;
   // PP-OCR det: dynamic up to 1600 (multi_resize emits <= 1280 by default; 1600 leaves room).
@@ -191,22 +251,28 @@ std::vector<PlanSpec> make_specs() {
                  {{fixed("images", {1, 3, 960, 960})}}};
   dfine.fp16_scopes = {"/model/backbone/"};
   s.push_back(dfine);
-  // PP-FormulaNet-S: FP32 encoder + prep, FP16 decoder step (see src/formula.cu), batch <= 8.
+  // PP-FormulaNet-S: FP32 encoder + prep, FP16 decoder step (see src/formula.cu), batch <= 8. The
+  // step takes its self-attention KV at 64..1056 slots (the slots in use, see pad_length_axis).
   const int64_t B = 8;
   s.push_back({"formula/encoder.onnx", "formula/encoder.plan", ModelGroup::kFormula,
                {{{"x", {1, 1, 384, 384}, {1, 1, 384, 384}, {B, 1, 384, 384}}}}, 3.0});
   s.push_back({"formula/prep.onnx", "formula/prep.plan", ModelGroup::kFormula,
                {{{"memory", {1, 144, 2048}, {B, 144, 2048}, {B, 144, 2048}}}}});
-  auto kv = [](int64_t b) { return std::vector<int64_t>{2, b, 16, 1056, 24}; };
+  auto kv = [](int64_t b, int64_t len = 1056) { return std::vector<int64_t>{2, b, 16, len, 24}; };
   auto ckv = [](int64_t b) { return std::vector<int64_t>{2, b, 16, 144, 24}; };
-  s.push_back({"formula/step_batched_fp16.onnx", "formula/step_fp16.plan", ModelGroup::kFormula,
-               {{{"tokens", {1, 3}, {B, 3}, {B, 3}},
-                 fixed("pos", {1}),
-                 {"kb", kv(1), kv(B), kv(B)},
-                 {"vb", kv(1), kv(B), kv(B)},
-                 {"ck", ckv(1), ckv(B), ckv(B)},
-                 {"cv", ckv(1), ckv(B), ckv(B)}}},
-               3.0, {}, false, true});
+  PlanSpec step{"formula/step_batched_fp16.onnx", "formula/step_fp16.plan", ModelGroup::kFormula,
+                {{{"tokens", {1, 3}, {B, 3}, {B, 3}},
+                  fixed("pos", {1}),
+                  {"kb", kv(1, 64), kv(B), kv(B)},
+                  {"vb", kv(1, 64), kv(B), kv(B)},
+                  {"ck", ckv(1), ckv(B), ckv(B)},
+                  {"cv", ckv(1), ckv(B), ckv(B)}}},
+                3.0};
+  step.host_shapes = true;
+  step.len_inputs = {"kb", "vb"};
+  step.len_outputs = {"kb_out", "vb_out"};
+  step.len_axis = 3;
+  s.push_back(std::move(step));
   // LayoutNet, FP16 (autocast; attention masks -3e4 instead of -1e9 so they fit) or INT8 (Q/DQ,
   // rest FP16). Units 2..1500 (pages with more skip the model, as the reference does).
   // OmniDocBench table pages, CPU reference: TEDS FP32 0.511, FP16 0.511, INT8 0.498.
@@ -277,6 +343,7 @@ void build_plan(const PlanSpec &spec, const std::string &onnx_dir, const std::st
   std::vector<std::vector<uint16_t>> fp16_weights;  // referenced by the network until the build ends
   if (!spec.fp16_scopes.empty() && strip_casts(*net, spec.fp16_scopes, fp16_weights) == 0)
     throw std::runtime_error("no FP32 casts to strip in " + onnx);
+  if (!spec.len_inputs.empty()) pad_length_axis(*net, spec.len_inputs, spec.len_outputs, spec.len_axis, spec.plan);
   std::unique_ptr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
   cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, static_cast<size_t>(spec.workspace_gb * (1ull << 30)));
   for (const Profile &p : spec.profiles) {
