@@ -59,6 +59,7 @@ void TableNet::reserve(int n) {
 Logits TableNet::forward(const std::vector<float> &feats, const std::vector<float> &pairf, int n, const ImgInput &img,
                          cudaStream_t stream) {
   if (n < 2 || n > static_cast<int>(kMaxUnits)) throw std::invalid_argument("LayoutNet: unit count out of range");
+  std::lock_guard lock(mu_);  // one context and one set of buffers
   reserve(n);
   const auto N = static_cast<int64_t>(n);
   if (!engine_->set_input_shape("feats", dims({1, N, kFeatDim})) || !engine_->set_input_shape("mask", dims({1, N})) ||

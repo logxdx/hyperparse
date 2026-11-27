@@ -5,6 +5,7 @@
 // cls [1,N,13]. N is dynamic, 2..kMaxUnits (one optimization profile).
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -20,13 +21,14 @@ namespace hp::tn {
 class TableNet {
  public:
   bool load(const std::string &plan_path);
-  // One page; blocks until the logits are on the host.
+  // One page; thread-safe (calls are serialized); blocks until the logits are on the host.
   Logits forward(const std::vector<float> &feats, const std::vector<float> &pairf, int n, const ImgInput &img,
                  cudaStream_t stream);
 
  private:
   void reserve(int n);
 
+  std::mutex mu_;
   std::unique_ptr<hp::core::engine::TrtEngine> engine_;
   int cap_ = 0;  // units the per-N buffers hold
   int n_pair_ = 5, n_cls_ = 13;

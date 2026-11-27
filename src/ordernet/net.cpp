@@ -49,6 +49,7 @@ void OrderNet::reserve(int n) {
 
 Heads OrderNet::forward(const std::vector<float> &feats, int n, cudaStream_t stream) {
   if (n < 2 || n > kMaxLines) throw std::invalid_argument("OrderNet: line count out of range");
+  std::lock_guard lock(mu_);  // one context and one set of buffers
   reserve(n);
   const auto N = static_cast<int64_t>(n);
   if (!engine_->set_input_shape("feats", dims({1, N, kFeats})) || !engine_->set_input_shape("mask", dims({1, N})))

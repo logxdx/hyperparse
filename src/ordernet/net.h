@@ -4,6 +4,7 @@
 // tab [1,3,N,N] (table relations; computed by the graph, not used). N is dynamic, 2..kMaxLines.
 
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -21,12 +22,13 @@ inline constexpr int kMaxLines = 2048;
 class OrderNet {
  public:
   bool load(const std::string &plan_path);
-  // One page; blocks until the heads are on the host.
+  // One page; thread-safe (calls are serialized); blocks until the heads are on the host.
   Heads forward(const std::vector<float> &feats, int n, cudaStream_t stream);
 
  private:
   void reserve(int n);
 
+  std::mutex mu_;
   std::unique_ptr<hp::core::engine::TrtEngine> engine_;
   int cap_ = 0;
   hp::core::CudaPtr<float> d_feats_, d_a_, d_cls_, d_same_, d_tab_;

@@ -50,8 +50,8 @@
 // alone. Every operation waits its turn in arrival order (FIFO): an operation
 // that cannot start yet (a lifecycle operation while parses run, a parse past the
 // document limit or behind a lifecycle operation) holds up the ones behind it.
-// The PageSink runs on the pipeline's assembly thread, which every document in
-// flight shares: a slow sink delays the other documents too.
+// The PageSink runs on one of the pipeline's assembly threads, never twice at
+// once for one document; the threads are shared by every document in flight.
 //
 // Process model: the constructor forks the page-worker supervisor
 // (render_pool.h). Construct the Engine early in the process lifetime, before
@@ -80,6 +80,9 @@ struct EngineConfig {
   // Documents parsed at once (concurrent parse() calls); more wait their turn.
   // 1 = one document at a time, end to end.
   int concurrent_documents = 8;
+  // Threads that assemble pages (LayoutNet, OrderNet, Markdown, sinks); formulas
+  // have a thread of their own.
+  int assembly_threads = 3;
   // A page whose text layer + render runs longer than this is killed and reported
   // as failed (120 s).
   std::chrono::milliseconds page_timeout{120000};

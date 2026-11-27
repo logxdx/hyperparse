@@ -10,9 +10,11 @@
 //        │                          H2D upload -> multi_resize -> D-FINE (lane stream)
 //        │                          OCR stage on the OCR stream (ocr_stage.h)
 //        │                          lane sync -> copy formula crops -> slot freed
-//        │  PageWork (queue)
-//   assembly thread               formula decode, batched across queued pages (of
-//                                 any document) -> reading order + Markdown -> sink
+//        │  PageWork (queue), pages with formula crops first through:
+//   formula thread                formula decode, batched across queued pages (of
+//        │                        any document)
+//   assembly threads (3)          LayoutNet tables, reading order + Markdown
+//                                 (OrderNet) -> sink, a page each, in parallel
 //
 // Back-pressure is the slot ring: a page is only submitted to the workers when a
 // slot is free, and a slot is freed as soon as the GPU no longer reads it.
@@ -46,6 +48,16 @@
 //    paper pages with 98 formulas: 25.1 pages/s without formulas, 11.8 with.
 //    Batching across pages fills the decoder's 8 sequence slots
 //    (FormulaRecognizer::kMaxBatch); its gain over per-page batches is unmeasured.
+//    The formula thread is apart from the assembly threads, so a cohort being
+//    decoded holds up only pages with formulas. A second decoder on a second
+//    thread gained 3% on arxiv100 (17.2 -> 17.8 pages/s): one decoder already
+//    keeps the GPU busy, so there is one.
+//  * Assembly on several threads: one thread was 44-48% busy on merged300 (LayoutNet
+//    13 ms per table page, OrderNet + Markdown 2.6 ms per page) and would bound
+//    the pipeline once the GPU side is faster. The CPU parts (features, decode,
+//    table clean-up, Markdown) run in parallel; LayoutNet and OrderNet each have
+//    one context, and their forward() calls take turns. A document's sink is
+//    never called twice at once.
 //  * Slots: 2 × workers + 2, so every worker can render ahead while both lanes
 //    hold a page.
 //
@@ -71,8 +83,9 @@ namespace hp {
 
 class PagePipeline {
  public:
-  // Starts the GPU and assembly threads. `models` and `pool` must outlive it.
-  PagePipeline(ModelSet &models, RenderPool &pool);
+  // Starts the GPU, formula and `assembly_threads` assembly threads. `models` and
+  // `pool` must outlive it.
+  PagePipeline(ModelSet &models, RenderPool &pool, int assembly_threads);
   // No parse() may be running.
   ~PagePipeline();
   PagePipeline(const PagePipeline &) = delete;

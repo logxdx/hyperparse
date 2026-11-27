@@ -84,9 +84,10 @@ struct PageResult {
 };
 
 // Called once per page as pages complete: in completion order (not page order),
-// never concurrently, from the engine's assembly thread. That thread serves every
-// document in flight, so a slow sink delays the others too. An exception thrown
-// by the sink aborts this parse only and is rethrown from Engine::parse.
+// never concurrently for one document, from one of the engine's assembly
+// threads. Those serve every document in flight, so a slow sink holds up a thread
+// the other documents share. An exception thrown by the sink aborts this parse
+// only and is rethrown from Engine::parse.
 using PageSink = std::function<void(PageResult &&)>;
 
 struct ParseStats {
@@ -109,13 +110,14 @@ struct ParseStats {
   double formula_ms = 0;
 
   int table_pages = 0, model_tables = 0;  // pages LayoutNet ran on, tables it returned
-  double table_ms = 0;                    // LayoutNet on the assembly thread (features, net, decode)
+  double table_ms = 0;                    // LayoutNet on the assembly threads (features, net, decode)
   int order_pages = 0;                     // pages ordered by OrderNet (the rest: XY-cut)
-  double order_ms = 0;                     // OrderNet on the assembly thread (features, net, decode, Markdown)
+  double order_ms = 0;                     // OrderNet on the assembly threads (features, net, decode, Markdown)
 
   // Where the wall time goes (which stage bounds throughput).
   double render_wait_ms = 0;   // GPU thread blocked waiting for a rendered page from the workers
-  double assembly_busy_ms = 0; // assembly thread working (formulas, LayoutNet, assembly, sink)
+  double assembly_busy_ms = 0; // assembly threads working, summed (LayoutNet, assembly, sink)
+  double formula_busy_ms = 0;  // formula thread working (decode runs)
   double drain_ms = 0;         // after the GPU thread's last page, until assembly is done
 };
 

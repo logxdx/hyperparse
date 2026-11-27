@@ -47,6 +47,7 @@ constexpr const char *kUsage =
     "\n"
     "Engine:\n"
     "  --workers N            page-rendering worker processes (0 = auto)\n"
+    "  --assembly-threads N   threads assembling pages: LayoutNet, OrderNet, Markdown (3)\n"
     "  --no-warmup            skip the warm-up; stats then include the cold start\n"
     "\n"
     "Models:\n"
@@ -91,6 +92,7 @@ Args parse_args(int argc, char **argv) {
     else if (k == "--dpi") a.parse.ocr_dpi = to_int(k, next());
     else if (k == "--det-side") a.engine.models.det_max_side = to_int(k, next());
     else if (k == "--workers") a.engine.workers = to_int(k, next());
+    else if (k == "--assembly-threads") a.engine.assembly_threads = std::max(1, to_int(k, next()));
     else if (k == "--models") a.engine.models.dir = next();
     else if (k == "--no-formula") a.engine.models.formula = a.parse.formulas = false;
     else if (k == "--no-tables") a.engine.models.tables = a.parse.tables = false;
@@ -123,7 +125,7 @@ Args parse_args(int argc, char **argv) {
   return a;
 }
 
-void print_stats(const hp::ParseStats &s) {
+void print_stats(const hp::ParseStats &s, int assembly_threads) {
   const int n = std::max(1, s.pages - s.failed);
   const int ocr_pages = s.routes[hp::kPartial] + s.routes[hp::kFullOcr];
   auto per_ocr = [&](double v) { return ocr_pages ? v / ocr_pages : 0.0; };
@@ -135,11 +137,11 @@ void print_stats(const hp::ParseStats &s) {
                "  GPU thread: OCR %.1f ms per OCR page (det+filter %.1f, rec %.1f), host wait on layout %.1f ms/page, "
                "assembly %.2f ms/page\n"
                "  region-only det on %d partial pages (mean canvas %.2f MP); %d text-layer boxes recognised without det\n"
-               "  formulas: %d recognised in %d batches, %.1f ms each on the assembly thread (%d decode step launches)\n"
-               "  tables: LayoutNet on %d pages with Table regions, %d tables, %.1f ms per page on the assembly thread\n"
-               "  reading order: OrderNet on %d pages, %.1f ms per page on the assembly thread (with Markdown)\n"
-               "  bound: GPU thread waited %.0f ms for renders (%.0f%% of wall); assembly busy %.0f ms (%.0f%%), "
-               "drain after the GPU thread %.0f ms\n",
+               "  formulas: %d recognised in %d batches, %.1f ms each on the formula thread (%d decode step launches)\n"
+               "  tables: LayoutNet on %d pages with Table regions, %d tables, %.1f ms per page on the assembly threads\n"
+               "  reading order: OrderNet on %d pages, %.1f ms per page on the assembly threads (with Markdown)\n"
+               "  bound: GPU thread waited %.0f ms for renders (%.0f%% of wall); formula thread busy %.0f ms (%.0f%%); "
+               "%d assembly threads busy %.0f ms (%.0f%% of their time); drain after the GPU thread %.0f ms\n",
                s.pages, parse_ms, s.pages * 1000.0 / std::max(parse_ms, 1e-3), s.failed,
                s.load_ms > 0 ? (" + " + std::to_string(static_cast<int>(s.load_ms)) + " ms model load").c_str() : "",
                s.routes[0], s.routes[1], s.routes[2], s.lines, s.rec_boxes, s.det_boxes, s.text_ms / n, s.render_ms / n,
@@ -148,8 +150,9 @@ void print_stats(const hp::ParseStats &s) {
                s.direct_rec_boxes, s.formulas, s.formula_batches, s.formulas ? s.formula_ms / s.formulas : 0.0,
                s.formula_steps, s.table_pages, s.model_tables, s.table_pages ? s.table_ms / s.table_pages : 0.0,
                s.order_pages, s.order_pages ? s.order_ms / s.order_pages : 0.0, s.render_wait_ms,
-               100 * s.render_wait_ms / std::max(parse_ms, 1e-3), s.assembly_busy_ms,
-               100 * s.assembly_busy_ms / std::max(parse_ms, 1e-3), s.drain_ms);
+               100 * s.render_wait_ms / std::max(parse_ms, 1e-3), s.formula_busy_ms,
+               100 * s.formula_busy_ms / std::max(parse_ms, 1e-3), assembly_threads, s.assembly_busy_ms,
+               100 * s.assembly_busy_ms / std::max(parse_ms * assembly_threads, 1e-3), s.drain_ms);
 }
 
 }  // namespace
@@ -197,7 +200,7 @@ int main(int argc, char **argv) try {
     for (int p = 0; p < stats.pages; ++p)
       md << "<!-- page " << p + 1 << " -->\n\n" << (p < static_cast<int>(md_pages.size()) ? md_pages[p] : "") << "\n\n";
   }
-  print_stats(stats);
+  print_stats(stats, engine.config().assembly_threads);
   return 0;
 } catch (const std::exception &e) {
   std::fprintf(stderr, "error: %s\n", e.what());

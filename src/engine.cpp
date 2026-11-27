@@ -131,7 +131,7 @@ void Engine::load_locked() {
   const double pin_ms = ms_since(t_pin);
   std::unique_ptr<PagePipeline> pipeline;
   try {
-    pipeline = std::make_unique<PagePipeline>(*models, *pool_);
+    pipeline = std::make_unique<PagePipeline>(*models, *pool_, cfg_.assembly_threads);
   } catch (...) {
     pool_->unpin_and_release();
     throw;

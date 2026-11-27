@@ -13,6 +13,7 @@
 #include <deque>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -49,7 +50,7 @@ const char *status_text(int s) {
 
 struct Doc;
 
-// A page between the GPU thread and the assembly thread.
+// A page between the GPU thread and the formula and assembly threads.
 struct PageWork {
   Doc *doc = nullptr;
   PageResult result;                          // filled progressively
@@ -113,7 +114,7 @@ tn::PageInput table_input(PageWork &w) {
 }
 
 // Copy every display-formula crop out of the page slot so the slot can be reused
-// while the formulas wait for the assembly thread.
+// while the formulas wait for the formula thread.
 void copy_formula_crops(const uint8_t *page, int w, int h, PageWork &pw) {
   const auto &boxes = pw.result.layout;
   for (size_t i = 0; i < boxes.size(); ++i) {
@@ -151,8 +152,10 @@ struct Doc {
   ParseStats gpu;       // the GPU thread's share of the stats
   Clock::time_point t_gpu_done;
 
-  // Assembly thread only: formulas, tables, reading order, assembly, lines.
-  ParseStats asm_stats;
+  // Formula and assembly threads: formulas, tables, reading order, assembly,
+  // lines; and the sink, which never runs twice at once for one document.
+  std::mutex asm_mu;
+  ParseStats asm_stats;  // guarded by asm_mu
 
   // Shared.
   std::atomic<bool> failed{false};
@@ -169,13 +172,14 @@ struct Doc {
 
 class PagePipeline::Impl {
  public:
-  Impl(ModelSet &m, RenderPool &pool) : m_(m), pool_(pool) {
+  Impl(ModelSet &m, RenderPool &pool, int assembly_threads) : m_(m), pool_(pool) {
     wake_fd_ = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
     if (wake_fd_ < 0) throw std::runtime_error("PagePipeline: eventfd failed");
     for (int s = pool_.documents() - 1; s >= 0; --s) free_doc_slots_.push_back(s);
     reset_slots();
-    assembly_ = std::thread([this] { assembly_loop(); });
     try {
+      for (int i = 0; i < std::max(1, assembly_threads); ++i) assembly_.emplace_back([this] { assembly_loop(); });
+      formula_ = std::thread([this] { formula_loop(); });
       gpu_ = std::thread([this] { gpu_loop(); });
     } catch (...) {
       stop_assembly();
@@ -226,7 +230,7 @@ class PagePipeline::Impl {
       release_doc_slot(slot);
       throw;
     }
-    const int64_t wait0 = render_wait_ns_.load(), busy0 = assembly_busy_ns_.load();
+    const int64_t wait0 = render_wait_ns_.load(), busy0 = assembly_busy_ns_.load(), fbusy0 = formula_busy_ns_.load();
     {
       std::lock_guard l(mu_);
       incoming_.push_back(&doc);
@@ -255,9 +259,10 @@ class PagePipeline::Impl {
     s.order_ms = a.order_ms;
     s.lines = a.lines;
     // While this document was in flight (with documents overlapping, the GPU
-    // thread's waits and the assembly thread's work also served the others).
+    // thread's waits and the assembly threads' work also served the others).
     s.render_wait_ms = static_cast<double>(render_wait_ns_.load() - wait0) / 1e6;
     s.assembly_busy_ms = static_cast<double>(assembly_busy_ns_.load() - busy0) / 1e6;
+    s.formula_busy_ms = static_cast<double>(formula_busy_ns_.load() - fbusy0) / 1e6;
     s.drain_ms = std::chrono::duration<double, std::milli>(doc.t_done - doc.t_gpu_done).count();
     s.wall_ms = ms_since(t_start);
     return s;
@@ -337,6 +342,8 @@ class PagePipeline::Impl {
         bool stop;
         {
           std::lock_guard l(mu_);
+          for (Doc *d : incoming_)
+            if (d->formulas) formula_upstream_ += d->n_pages;
           docs_.insert(docs_.end(), incoming_.begin(), incoming_.end());
           incoming_.clear();
           stop = stop_;
@@ -467,14 +474,39 @@ class PagePipeline::Impl {
     for (int s = pool_.slots() - 1; s >= 0; --s) free_slots_.push_back(s);
   }
 
-  // A page leaves the GPU thread: to the assembly thread, or dropped.
+  // A page leaves the GPU thread: to the formula or assembly threads, or dropped.
   void left_gpu(Doc &d, int n) {
     d.gpu_left -= n;
     if (d.gpu_left == 0) d.t_gpu_done = Clock::now();
+    if (d.formulas && formula_upstream_.fetch_sub(n) == n) {
+      { std::lock_guard l(fmu_); }  // the formula thread is waiting, or will see 0
+      fcv_.notify_all();
+    }
   }
+  // Pages with formula crops go through the formula thread first, the others
+  // straight to the assembly threads.
   void hand_on(PageWork &&w) {
     Doc &d = *w.doc;
-    left_gpu(d, 1);  // before the push: the assembly thread may complete `d` at once
+    left_gpu(d, 1);  // before the push: an assembly thread may complete `d` at once
+    if (!w.crop_px.empty()) {
+      try {
+        std::lock_guard l(fmu_);
+        if (fq_.empty()) fq_since_ = Clock::now();
+        fq_crops_ += w.crop_px.size();
+        fq_.push_back(std::move(w));
+      } catch (...) {
+        fail(d, std::current_exception());
+        finish_pages(d, 1);
+        return;
+      }
+      fcv_.notify_one();
+      return;
+    }
+    to_assembly(std::move(w));
+  }
+
+  void to_assembly(PageWork &&w) {
+    Doc &d = *w.doc;
     try {
       std::lock_guard l(amu_);
       aq_.push_back(std::move(w));
@@ -648,7 +680,7 @@ class PagePipeline::Impl {
     st.render_ms += d.render_ms;
 
     // A scan turned sideways or upside down (orient.h) is turned upright in the slot before anything
-    // reads it; the assembly thread maps the page's coordinates back. Only pages read wholly from
+    // reads it; an assembly thread maps the page's coordinates back. Only pages read wholly from
     // pixels: no text-layer item or box (page coordinates of the unturned page) takes part.
     job.work.w0 = d.w, job.work.h0 = d.h;
     if (m_.has_orient() && job.rt.kind == kFullOcr && job.rt.rec_boxes.empty() &&
@@ -737,7 +769,7 @@ class PagePipeline::Impl {
     for (auto &l : ocr.lines) job.work.items.push_back(std::move(l));
   }
 
-  // Wait for the lane's layout, take what the assembly thread needs out of the
+  // Wait for the lane's layout, take what assembly needs out of the
   // slot, free the slot, hand the page on.
   void finish(int lane_index) {
     LaneJob &job = lanes_[lane_index];
@@ -768,99 +800,140 @@ class PagePipeline::Impl {
     else drop(doc, 1);
   }
 
-  // ── assembly thread ───────────────────────────────────────────────────────
-  // Drains every page queued so far, decodes all of their formula crops together,
-  // then assembles and delivers each page.
+  // ── formula thread ────────────────────────────────────────────────────────
+  // Drains every page queued so far and decodes all of their formula crops in
+  // one run (cohorts fill the decoder's batch), attaches the LaTeX, and passes
+  // the pages on to the assembly threads. On its own thread so that a formula
+  // cohort holds up only the pages that have formulas. (A second decoder on a
+  // thread of its own gained 3%: one decoder already keeps the GPU busy.)
+
+  void formula_loop() {
+    for (;;) {
+      std::vector<PageWork> batch;
+      {
+        // Gather a full cohort while more formula pages are on their way: the
+        // decoder's cost is per step of a whole batch, so a run of a few crops
+        // costs nearly what a full one does.
+        std::unique_lock l(fmu_);
+        for (;;) {
+          if (fq_.empty()) {
+            if (fstop_) return;
+            fcv_.wait(l);
+            continue;
+          }
+          const auto deadline = fq_since_ + kFormulaGather;
+          if (fstop_ || fq_crops_ >= static_cast<size_t>(FormulaRecognizer::kCohort) || formula_upstream_.load() == 0 ||
+              Clock::now() >= deadline)
+            break;
+          fcv_.wait_until(l, deadline);
+        }
+        while (!fq_.empty()) {
+          batch.push_back(std::move(fq_.front()));
+          fq_.pop_front();
+        }
+        fq_crops_ = 0;
+      }
+      const auto t0 = Clock::now();
+      decode_formulas(batch);
+      formula_busy_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
+      for (PageWork &w : batch) to_assembly(std::move(w));
+    }
+  }
+
+  // Never throws. If the run fails, so does every document in the batch.
+  void decode_formulas(std::vector<PageWork> &batch) {
+    try {
+      std::vector<FormulaCrop> crops;
+      std::vector<std::pair<Doc *, int>> doc_crops;  // crops per live document
+      std::vector<char> in_run(batch.size(), 0);
+      for (size_t i = 0; i < batch.size(); ++i) {
+        PageWork &w = batch[i];
+        if (w.doc->failed.load()) continue;  // dropped by an assembly thread
+        in_run[i] = 1;
+        for (size_t k = 0; k < w.crop_px.size(); ++k)
+          crops.push_back({w.crop_px[k].data(), static_cast<size_t>(w.crop_meta[k][1]) * 3, w.crop_meta[k][1],
+                           w.crop_meta[k][2]});
+        auto it = std::find_if(doc_crops.begin(), doc_crops.end(), [&](const auto &dc) { return dc.first == w.doc; });
+        if (it == doc_crops.end()) doc_crops.push_back({w.doc, 0}), it = doc_crops.end() - 1;
+        it->second += static_cast<int>(w.crop_px.size());
+      }
+      if (crops.empty()) return;
+      FormulaRecognizer &f = m_.formula();
+      const int steps0 = f.steps_run;
+      const auto t = Clock::now();
+      const std::vector<std::string> latex = f.run(crops, m_.formula_stream());
+      const double ms = ms_since(t);
+      const int steps = f.steps_run - steps0;
+      size_t c = 0;
+      for (size_t i = 0; i < batch.size(); ++i) {
+        PageWork &w = batch[i];
+        if (!in_run[i]) continue;
+        for (size_t k = 0; k < w.crop_px.size(); ++k, ++c) w.result.formulas.push_back({w.crop_meta[k][0], latex[c], 1.f});
+        w.crop_px.clear();  // the crops are done with
+      }
+      // A shared run serves each of its documents in full.
+      for (auto &[d, n] : doc_crops) {
+        std::lock_guard l(d->asm_mu);
+        d->asm_stats.formulas += n;
+        d->asm_stats.formula_ms += ms;
+        ++d->asm_stats.formula_batches;
+        d->asm_stats.formula_steps += steps;
+      }
+    } catch (...) {
+      for (PageWork &w : batch) fail(*w.doc, std::current_exception());  // every page here has crops
+    }
+  }
+
+  // ── assembly threads ──────────────────────────────────────────────────────
+  // Each takes the next page: LayoutNet on its Table regions, reading order and
+  // Markdown (OrderNet), then the document's sink. The CPU work runs in
+  // parallel; LayoutNet and OrderNet calls take turns on their one context.
 
   void stop_assembly() {
+    {
+      std::lock_guard l(fmu_);
+      fstop_ = true;
+    }
+    fcv_.notify_all();
+    if (formula_.joinable()) formula_.join();  // first: it feeds the assembly queue
     {
       std::lock_guard l(amu_);
       astop_ = true;
     }
     acv_.notify_all();
-    if (assembly_.joinable()) assembly_.join();
+    for (std::thread &t : assembly_)
+      if (t.joinable()) t.join();
   }
 
   void assembly_loop() {
     for (;;) {
-      std::vector<PageWork> batch;
+      std::optional<PageWork> w;
       {
         std::unique_lock l(amu_);
         acv_.wait(l, [&] { return !aq_.empty() || astop_; });
         if (aq_.empty()) return;
-        while (!aq_.empty()) {
-          batch.push_back(std::move(aq_.front()));
-          aq_.pop_front();
-        }
+        w.emplace(std::move(aq_.front()));
+        aq_.pop_front();
       }
-      process(batch);
-    }
-  }
-
-  // Never throws: every page of the batch is delivered or dropped.
-  void process(std::vector<PageWork> &batch) {
-    auto t_last = Clock::now();
-    auto busy = [&] {  // assembly time so far, counted before each page's document can complete
-      const auto now = Clock::now();
-      assembly_busy_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_last).count();
-      t_last = now;
-    };
-
-    // Formula crops of the live documents' pages, decoded in one run. If that
-    // fails, so does every document with crops in the batch.
-    std::vector<size_t> first_crop(batch.size(), SIZE_MAX);
-    std::vector<std::string> latex;
-    try {
-      std::vector<FormulaCrop> crops;
-      std::vector<Doc *> crop_docs;
-      for (size_t i = 0; i < batch.size(); ++i) {
-        PageWork &w = batch[i];
-        if (w.crop_px.empty() || w.doc->failed.load()) continue;
-        first_crop[i] = crops.size();
-        for (size_t k = 0; k < w.crop_px.size(); ++k)
-          crops.push_back({w.crop_px[k].data(), static_cast<size_t>(w.crop_meta[k][1]) * 3, w.crop_meta[k][1],
-                           w.crop_meta[k][2]});
-        w.doc->asm_stats.formulas += static_cast<int>(w.crop_px.size());
-        if (std::find(crop_docs.begin(), crop_docs.end(), w.doc) == crop_docs.end()) crop_docs.push_back(w.doc);
-      }
-      if (!crops.empty()) {
-        const int steps0 = m_.formula().steps_run;
-        const auto t = Clock::now();
-        latex = m_.formula().run(crops, m_.formula_stream());
-        const double ms = ms_since(t);
-        // A shared run serves each of its documents in full.
-        for (Doc *d : crop_docs) {
-          d->asm_stats.formula_ms += ms;
-          ++d->asm_stats.formula_batches;
-          d->asm_stats.formula_steps += m_.formula().steps_run - steps0;
-        }
-      }
-    } catch (...) {
-      for (PageWork &w : batch)
-        if (!w.crop_px.empty()) fail(*w.doc, std::current_exception());
-    }
-
-    for (size_t i = 0; i < batch.size(); ++i) {
-      PageWork &w = batch[i];
-      Doc &d = *w.doc;
+      const auto t0 = Clock::now();
+      Doc &d = *w->doc;
       if (!d.failed.load()) {
         try {
-          deliver(w, d, first_crop[i] == SIZE_MAX ? nullptr : latex.data() + first_crop[i]);
+          deliver(*w, d);
         } catch (...) {
           fail(d, std::current_exception());
         }
       }
-      busy();
+      w.reset();
+      assembly_busy_ns_ += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count();
       finish_pages(d, 1);  // `d` may be gone now
     }
   }
 
-  void deliver(PageWork &w, Doc &d, const std::string *latex) {
-    ParseStats &st = d.asm_stats;
+  void deliver(PageWork &w, Doc &d) {
+    ParseStats st;  // this page's share, added under the document's lock
     PageResult &r = w.result;
     if (r.ok) {
-      if (latex)
-        for (size_t k = 0; k < w.crop_px.size(); ++k) r.formulas.push_back({w.crop_meta[k][0], latex[k], 1.f});
       std::vector<ModelTable> model_tables;
       if (!w.grey.empty()) {
         const auto tt = Clock::now();
@@ -893,6 +966,16 @@ class PagePipeline::Impl {
         r.width = w.w0, r.height = w.h0, r.rotation = w.rot;
       }
     }
+    std::lock_guard l(d.asm_mu);
+    ParseStats &a = d.asm_stats;
+    a.table_ms += st.table_ms;
+    a.table_pages += st.table_pages;
+    a.model_tables += st.model_tables;
+    a.assemble_ms += st.assemble_ms;
+    a.order_pages += st.order_pages;
+    a.order_ms += st.order_ms;
+    a.lines += st.lines;
+    if (d.failed.load()) return;  // another page's sink failed meanwhile
     (*d.sink)(std::move(r));
   }
 
@@ -907,8 +990,9 @@ class PagePipeline::Impl {
   std::vector<int> free_doc_slots_;
   bool stop_ = false;
 
-  // While-in-flight totals for ParseStats::render_wait_ms / assembly_busy_ms.
-  std::atomic<int64_t> render_wait_ns_{0}, assembly_busy_ns_{0};
+  // While-in-flight totals for ParseStats::render_wait_ms / assembly_busy_ms /
+  // formula_busy_ms.
+  std::atomic<int64_t> render_wait_ns_{0}, assembly_busy_ns_{0}, formula_busy_ns_{0};
 
   // GPU thread only.
   std::vector<Doc *> docs_;  // documents that may still get or return page jobs
@@ -921,16 +1005,29 @@ class PagePipeline::Impl {
   std::vector<Ready> ready_;  // rendered pages waiting for the GPU (start_next)
   uint64_t slot_turns_ = 0, gpu_turns_ = 0;
 
+  // Formula queue.
+  static constexpr auto kFormulaGather = std::chrono::milliseconds(100);  // longest wait for a fuller cohort
+  std::mutex fmu_;
+  std::condition_variable fcv_;
+  std::deque<PageWork> fq_;
+  size_t fq_crops_ = 0;         // crops queued
+  Clock::time_point fq_since_;  // the oldest queued page's arrival
+  bool fstop_ = false;
+  // Pages of documents with formulas that have not left the GPU thread yet.
+  std::atomic<int> formula_upstream_{0};
+
   // Assembly queue.
   std::mutex amu_;
   std::condition_variable acv_;
   std::deque<PageWork> aq_;
   bool astop_ = false;
 
-  std::thread assembly_, gpu_;
+  std::vector<std::thread> assembly_;
+  std::thread formula_, gpu_;
 };
 
-PagePipeline::PagePipeline(ModelSet &models, RenderPool &pool) : impl_(std::make_unique<Impl>(models, pool)) {}
+PagePipeline::PagePipeline(ModelSet &models, RenderPool &pool, int assembly_threads)
+    : impl_(std::make_unique<Impl>(models, pool, assembly_threads)) {}
 PagePipeline::~PagePipeline() = default;
 
 ParseStats PagePipeline::parse(std::span<const uint8_t> pdf, const ParseOptions &opt, const PageSink &sink) {
