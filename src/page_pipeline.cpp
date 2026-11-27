@@ -963,7 +963,7 @@ class PagePipeline::Impl {
         st.model_tables += static_cast<int>(model_tables.size());
       }
       const auto t = Clock::now();
-      AssembledPage page = assemble_page(r.page, r.width, r.height, r.layout, w.items, merge_into_lines(w.items),
+      AssembledPage page = assemble_page(r.page, r.width, r.height, r.layout, w.items, merge_into_lines(w.items, &r.layout),
                                          r.formulas, model_tables, d.ordernet ? &m_.ordernet() : nullptr,
                                          m_.table_stream());
       const double ams = ms_since(t);

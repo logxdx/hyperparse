@@ -65,7 +65,9 @@ struct AssembledPage {
 
 // Merge word/phrase items (extraction order) into visual lines. inline_ocr items are
 // first slotted in after their left neighbour on the same line.
-std::vector<PageLine> merge_into_lines(const std::vector<PageLine> &items);
+// `layout` (optional): two detected OCR lines merge only when their centres fall in the same layout
+// region (the smallest box holding each), so lines of neighbouring columns stay apart.
+std::vector<PageLine> merge_into_lines(const std::vector<PageLine> &items, const std::vector<LayoutBox> *layout = nullptr);
 
 // `items` are the spans before merge_into_lines (table cells come from them);
 // `lines` are the merged lines.
