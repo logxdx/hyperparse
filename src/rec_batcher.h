@@ -9,6 +9,10 @@
 // lines are sorted by exact width and packed under a column budget; every batch's
 // crops are cut in ONE CropBatch launch (bit-identical to batch_roi_warp), argmax
 // for all batches lands in one buffer and comes back in one D2H.
+//
+// The plan outputs FP16 logits (PlanSpec::logits_output): the engine's softmax over
+// 18,385 classes and its FP32 output were 20% of the engine time plus an FP32 argmax
+// pass; cuda_argmax_logits takes the argmax and the softmax maximum in one FP16 pass.
 
 #include <memory>
 #include <string>
@@ -46,7 +50,8 @@ class RecBatcher final : public TextRecognizer {
   hp::core::CudaPtr<uint8_t> d_non_cjk_;  // class mask for no_cjk (script.h)
   int classes_ = 0;
   CropBatch crops_;
-  hp::core::CudaPtr<float> d_in_, d_out_, d_score_;
+  hp::core::CudaPtr<float> d_in_, d_score_;
+  hp::core::CudaPtr<uint16_t> d_out_;  // FP16 logits of one batch (logits plan)
   hp::core::CudaPtr<int> d_idx_;
   hp::core::CudaHostPtr<float> h_score_;
   hp::core::CudaHostPtr<int> h_idx_;

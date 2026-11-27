@@ -2,6 +2,7 @@
 #include "core/common/cuda/cuda_check.h"
 #include <cfloat>
 #include <climits>
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 #include <device_launch_parameters.h>
 
@@ -90,6 +91,85 @@ void cuda_argmax(const float *input_probs, int *output_indices,
   // One block per step, 256 threads per block for parallel reduction
   argmax_kernel<<<total_steps, 256, 0, stream>>>(
       input_probs, output_indices, output_scores, total_steps, num_classes, class_ok);
+  CUDA_CHECK(cudaGetLastError());
+}
+
+// --- ArgMax + softmax score from FP16 logits ---
+
+namespace {
+
+struct SoftArg {
+  float m;    // running max over all classes
+  float s;    // sum of exp(l - m) over all classes
+  float bv;   // best allowed logit
+  int bi;     // its class (lowest on ties)
+};
+
+__device__ __forceinline__ SoftArg merge(SoftArg a, const SoftArg &b) {
+  const float M = fmaxf(a.m, b.m);
+  float s = 0.f;
+  if (a.m != -INFINITY) s += a.s * __expf(a.m - M);
+  if (b.m != -INFINITY) s += b.s * __expf(b.m - M);
+  a.m = M;
+  a.s = s;
+  if (b.bv > a.bv || (b.bv == a.bv && b.bi < a.bi)) {
+    a.bv = b.bv;
+    a.bi = b.bi;
+  }
+  return a;
+}
+
+__device__ __forceinline__ SoftArg shfl_down(const SoftArg &v, int off) {
+  return {__shfl_down_sync(0xffffffffu, v.m, off), __shfl_down_sync(0xffffffffu, v.s, off),
+          __shfl_down_sync(0xffffffffu, v.bv, off), __shfl_down_sync(0xffffffffu, v.bi, off)};
+}
+
+}  // namespace
+
+// One block per row. Each thread runs an online softmax (max, sum) over its
+// stride of classes and keeps the best allowed class; warps then the block merge.
+__global__ __launch_bounds__(256)
+void argmax_logits_kernel(const __half *__restrict__ logits, int *__restrict__ out_idx,
+                          float *__restrict__ out_score, int rows, int num_classes,
+                          const uint8_t *__restrict__ class_ok) {
+  const int row = blockIdx.x;
+  if (row >= rows) return;
+  const __half *r = logits + (size_t)row * num_classes;
+  SoftArg a{-INFINITY, 0.f, -INFINITY, INT_MAX};
+  for (int c = threadIdx.x; c < num_classes; c += blockDim.x) {
+    const float v = __half2float(r[c]);
+    if (v > a.m) {
+      a.s = a.s * __expf(a.m - v) + 1.f;
+      a.m = v;
+    } else {
+      a.s += __expf(v - a.m);
+    }
+    if ((!class_ok || class_ok[c]) && v > a.bv) {  // ascending c: strict > keeps the lowest index
+      a.bv = v;
+      a.bi = c;
+    }
+  }
+  for (int off = 16; off > 0; off >>= 1) a = merge(a, shfl_down(a, off));
+  __shared__ SoftArg warp_res[8];
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  if (lane == 0) warp_res[warp] = a;
+  __syncthreads();
+  if (warp == 0) {
+    const int nw = blockDim.x >> 5;
+    a = lane < nw ? warp_res[lane] : SoftArg{-INFINITY, 0.f, -INFINITY, INT_MAX};
+    for (int off = 16; off > 0; off >>= 1) a = merge(a, shfl_down(a, off));
+    if (lane == 0) {
+      out_idx[row] = a.bi == INT_MAX ? 0 : a.bi;
+      out_score[row] = a.bi == INT_MAX ? 0.f : __expf(a.bv - a.m) / a.s;
+    }
+  }
+}
+
+void cuda_argmax_logits(const uint16_t *logits_f16, int *output_indices, float *output_scores, int rows,
+                        int num_classes, cudaStream_t stream, const uint8_t *class_ok) {
+  if (rows <= 0) return;
+  argmax_logits_kernel<<<rows, 256, 0, stream>>>(reinterpret_cast<const __half *>(logits_f16), output_indices,
+                                                 output_scores, rows, num_classes, class_ok);
   CUDA_CHECK(cudaGetLastError());
 }
 

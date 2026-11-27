@@ -45,7 +45,8 @@ ModelSet::ModelSet(const ModelConfig &cfg) : cfg_(cfg) {
     if (!det_->load(d + "/det_small_fp16.plan", cfg_.det_max_side)) throw std::runtime_error("det load failed: " + d);
     load_times_.det_ms = ms_since(t);
     t = Clock::now();
-    rec_ = load_text_recognizer(cfg_.rec, d + "/rec_small_fp16.plan", d + "/keys_small.txt", ocr_stream_);
+    rec_ = load_text_recognizer(cfg_.rec, d + "/" + (cfg_.rec == RecMode::kWidthBucket ? kRecProbsPlan : kRecLogitsPlan),
+                                d + "/keys_small.txt", ocr_stream_);
     load_times_.rec_ms = ms_since(t);
     // Page orientation: optional (doc_ori.plan exists only when the models dir carries doc_ori.onnx).
     if (cfg_.orient && std::ifstream(d + "/doc_ori.plan").good()) {

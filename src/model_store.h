@@ -17,6 +17,7 @@ struct ModelNeeds {
   bool ordernet = true;  // OrderNet (order_<precision>.onnx)
   std::string tables_precision = "fp16";  // fp16 | int8
   std::string order_precision = "fp16";   // fp16 | int8
+  bool rec_probs = false;  // the width-bucket recogniser's softmax plan instead of the logits plan
 };
 
 // Returns a directory for ModelConfig::dir holding every plan and asset `needs`

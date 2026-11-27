@@ -160,7 +160,8 @@ int main(int argc, char **argv) try {
   a.engine.models.dir = hp::prepare_models(a.engine.models.dir, {a.engine.models.ocr, a.engine.models.formula, a.engine.models.tables,
                                                                        a.engine.models.ordernet,
                                                                        a.engine.models.tables_precision,
-                                                                       a.engine.models.order_precision});
+                                                                       a.engine.models.order_precision,
+                                                                       a.engine.models.rec == hp::RecMode::kWidthBucket});
   if (a.prepare_only) {
     std::printf("%s\n", a.engine.models.dir.c_str());
     return 0;

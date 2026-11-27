@@ -31,6 +31,15 @@ void cuda_argmax(const float *input_probs, int *output_indices,
                  int num_classes, cudaStream_t stream = 0,
                  const uint8_t *class_ok = nullptr);
 
+// ArgMax + softmax score from FP16 logits ([rows, num_classes], a rec plan
+// built with logits_output): index = argmax over the allowed classes (lowest
+// index on ties), score = its softmax probability over ALL classes, computed
+// in FP32 in one pass (online max/sum). Same outputs as softmax -> cuda_argmax
+// up to rounding, without the FP32 probability tensor.
+void cuda_argmax_logits(const uint16_t *logits_f16, int *output_indices,
+                        float *output_scores, int rows, int num_classes,
+                        cudaStream_t stream = 0, const uint8_t *class_ok = nullptr);
+
 // Fused resize + normalize + CHW for detection (eliminates intermediate buffer)
 void cuda_fused_resize_normalize_det(const GpuImage &src, float *dst_chw,
                                       int dst_w, int dst_h,

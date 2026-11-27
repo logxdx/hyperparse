@@ -30,7 +30,7 @@ bool RecBatcher::load(const std::string &plan, const std::string &dict) {
   CUDA_CHECK(cudaMemcpy(d_non_cjk_.get(), mask.data(), mask.size(), cudaMemcpyHostToDevice));
   // Largest single batch: the column budget, or one line at max width.
   const size_t max_cols = std::max(kColumnBudget, kMaxW);
-  d_out_ = hp::core::CudaPtr<float>(max_cols / 8 * (size_t)classes_);
+  d_out_ = hp::core::CudaPtr<uint16_t>(max_cols / 8 * (size_t)classes_);  // FP16 logits
   return true;
 }
 
@@ -105,8 +105,8 @@ void RecBatcher::enqueue(const hp::core::GpuImage &img, std::span<const RecGroup
     if (!engine_->infer_dynamic(d, s)) throw std::runtime_error("rec execute failed");
     b.T = engine_->get_output_dims().d[1];
     if (b.T > b.W / 8) throw std::runtime_error("rec: unexpected sequence length");
-    hp::core::kernels::cuda_argmax(d_out_.get(), d_idx_.get() + b.row_off, d_score_.get() + b.row_off, cnt, b.T,
-                                    classes_, s, b.no_cjk ? d_non_cjk_.get() : nullptr);
+    hp::core::kernels::cuda_argmax_logits(d_out_.get(), d_idx_.get() + b.row_off, d_score_.get() + b.row_off,
+                                          cnt * b.T, classes_, s, b.no_cjk ? d_non_cjk_.get() : nullptr);
   }
   // Rows are laid out per batch at stride W/8 per line; copy the whole region once.
   CUDA_CHECK(cudaMemcpyAsync(h_idx_.get(), d_idx_.get(), rows_total * sizeof(int), cudaMemcpyDeviceToHost, s));

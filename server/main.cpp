@@ -20,7 +20,8 @@ int main(int argc, char **argv) try {
   cfg.engine.models.dir = hp::prepare_models(cfg.engine.models.dir, {cfg.engine.models.ocr, cfg.engine.models.formula, cfg.engine.models.tables,
                                                                          cfg.engine.models.ordernet,
                                                                          cfg.engine.models.tables_precision,
-                                                                         cfg.engine.models.order_precision});
+                                                                         cfg.engine.models.order_precision,
+                                                                       cfg.engine.models.rec == hp::RecMode::kWidthBucket});
 
   // First: the Engine forks its page-worker supervisor, which must happen
   // before any other thread exists (render_pool.h).

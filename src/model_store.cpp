@@ -87,6 +87,7 @@ bool needed(ModelGroup g, ModelNeeds n) {
 bool needed(const PlanSpec &s, const ModelNeeds &n) {
   if (!needed(s.group, n)) return false;
   if (s.variant.empty()) return true;
+  if (s.group == ModelGroup::kOcr) return s.variant == (n.rec_probs ? "probs" : "logits");
   return s.variant == (s.group == ModelGroup::kTables ? n.tables_precision : n.order_precision);
 }
 
@@ -394,7 +395,7 @@ std::string plan_source_key(const PlanSpec &s, const fs::path &onnx_dir) {
     for (const json &f : m["files"])
       if (f.at("path") == s.onnx) sha = f.at("sha256").get<std::string>();
   if (sha.empty() && fs::exists(onnx_dir / s.onnx)) sha = sha256_file(onnx_dir / s.onnx);
-  std::string key = sha + " ws=" + std::to_string(s.workspace_gb);
+  std::string key = sha + " ws=" + std::to_string(s.workspace_gb) + (s.logits_output ? " logits" : "");
   if (s.host_shapes) key += " host_shapes";
   for (const Profile &p : s.profiles) {
     key += " |";

@@ -80,8 +80,16 @@ std::vector<PlanSpec> make_specs() {
   s.push_back({"det_small_fp16.onnx", "det_small_fp16.plan", ModelGroup::kOcr,
                {{{"x", {1, 3, 32, 32}, {1, 3, 1280, 992}, {2, 3, 1600, 1600}}}}});
   // PP-OCR rec: profile 0 dynamic, then one fixed profile per kRecGraphProfiles entry, in order.
-  PlanSpec rec{"rec_small_fp16.onnx", "rec_small_fp16.plan", ModelGroup::kOcr,
+  // Column-budget rec (rec_batcher.h): logits output, profile 0 only.
+  PlanSpec rec{"rec_small_fp16.onnx", kRecLogitsPlan, ModelGroup::kOcr,
                {{{"x", {1, 3, 48, 48}, {32, 3, 48, 320}, {32, 3, 48, 4000}}}}};
+  rec.variant = "logits";
+  rec.logits_output = true;
+  s.push_back(rec);
+  // Width-bucket rec (--rec bucket): softmax output, plus the fixed graph profiles.
+  rec.plan = kRecProbsPlan;
+  rec.variant = "probs";
+  rec.logits_output = false;
   const int64_t graphs[][2] = {{8, 320}, {16, 320}, {24, 320}, {32, 320}, {8, 480}, {16, 480},
                                {24, 480}, {32, 480}, {8, 800}, {16, 800}, {8, 1600}, {8, 4000}};
   for (const auto &g : graphs) rec.profiles.push_back({fixed("x", {g[0], 3, 48, g[1]})});
@@ -164,6 +172,14 @@ void build_plan(const PlanSpec &spec, const std::string &onnx_dir, const std::st
     throw std::runtime_error(err);
   }
   if (spec.host_shapes) fold_shape_scatters(*net);
+  if (spec.logits_output) {
+    nvinfer1::ILayer *softmax = nullptr;
+    for (int i = net->getNbLayers() - 1; i >= 0 && !softmax; --i)
+      if (net->getLayer(i)->getType() == nvinfer1::LayerType::kSOFTMAX) softmax = net->getLayer(i);
+    if (!softmax || net->getNbOutputs() != 1) throw std::runtime_error("no softmax output to strip in " + onnx);
+    net->unmarkOutput(*net->getOutput(0));
+    net->markOutput(*softmax->getInput(0));
+  }
   std::unique_ptr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
   cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, static_cast<size_t>(spec.workspace_gb * (1ull << 30)));
   for (const Profile &p : spec.profiles) {

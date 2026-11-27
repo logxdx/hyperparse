@@ -30,7 +30,16 @@ struct PlanSpec {
   // Shape-vector scatters rewritten as slices + concat, so that every shape is known on the host
   // and enqueueV3 neither waits for the GPU nor breaks CUDA graph capture (engine_build.cpp).
   bool host_shapes = false;
+  // Build with the input of the network's last Softmax as the output (rec: hp's argmax kernel
+  // reads the logits and computes the softmax maximum itself, so the engine skips the softmax
+  // over every class and the FP32 probability tensor).
+  bool logits_output = false;
 };
+
+// PP-OCR rec plans: the default column-budget recogniser loads the logits plan (profile 0 only);
+// the width-bucket recogniser (--rec bucket) the softmax plan with its fixed CUDA-graph profiles.
+inline constexpr const char *kRecLogitsPlan = "rec_small_logits_fp16.plan";
+inline constexpr const char *kRecProbsPlan = "rec_small_fp16.plan";
 
 // LayoutNet (OCRia-nano-1's tablenet) and OrderNet (Indra OCR's order) come in reduced-precision
 // variants: tablenet_<v>.onnx / order_<v>.onnx -> tablenet_<v>.plan / order_<v>.plan, v = fp16 | int8.
