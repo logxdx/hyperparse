@@ -397,6 +397,7 @@ std::string plan_source_key(const PlanSpec &s, const fs::path &onnx_dir) {
   if (sha.empty() && fs::exists(onnx_dir / s.onnx)) sha = sha256_file(onnx_dir / s.onnx);
   std::string key = sha + " ws=" + std::to_string(s.workspace_gb) + (s.logits_output ? " logits" : "");
   if (s.host_shapes) key += " host_shapes";
+  for (const std::string &sc : s.fp16_scopes) key += " fp16:" + sc;
   for (const Profile &p : s.profiles) {
     key += " |";
     for (const InputRange &r : p) {

@@ -32,7 +32,7 @@ ModelSet::ModelSet(const ModelConfig &cfg) : cfg_(cfg) {
   // engine across execution contexts corrupts output under concurrency
   // (engine_loader.h), and the plans are batch-1 because a batch-8 plan ran out
   // of memory on this 6 GB card with two lanes.
-  const std::string dfine = d + "/dfine_" + std::to_string(kLayoutSize) + "_fp16.plan";
+  const std::string dfine = d + "/" + kLayoutPlan;
   auto t = Clock::now();
   for (auto &lane : lanes_) {
     lane = std::make_unique<LayoutLane>();

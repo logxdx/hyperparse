@@ -34,12 +34,19 @@ struct PlanSpec {
   // reads the logits and computes the softmax maximum itself, so the engine skips the softmax
   // over every class and the FP32 probability tensor).
   bool logits_output = false;
+  // Layers whose name contains one of these run in FP16 only: the FP16<->FP32 casts between them
+  // are dropped and the FP32 constants their element-wise ops read become FP16 (strip_casts in
+  // engine_build.cpp). For a mixed-precision ONNX whose autocast left BatchNorm and affine ops in
+  // FP32 between FP16 convs.
+  std::vector<std::string> fp16_scopes = {};
 };
 
 // PP-OCR rec plans: the default column-budget recogniser loads the logits plan (profile 0 only);
 // the width-bucket recogniser (--rec bucket) the softmax plan with its fixed CUDA-graph profiles.
 inline constexpr const char *kRecLogitsPlan = "rec_small_logits_fp16.plan";
 inline constexpr const char *kRecProbsPlan = "rec_small_fp16.plan";
+// D-FINE layout, built with an all-FP16 backbone (PlanSpec::fp16_scopes).
+inline constexpr const char *kLayoutPlan = "dfine_960_fp16bb.plan";
 
 // LayoutNet (OCRia-nano-1's tablenet) and OrderNet (Indra OCR's order) come in reduced-precision
 // variants: tablenet_<v>.onnx / order_<v>.onnx -> tablenet_<v>.plan / order_<v>.plan, v = fp16 | int8.

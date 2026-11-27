@@ -11,6 +11,13 @@
 #include <stdexcept>
 #include <unistd.h>
 
+#include <cstring>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+
+#include <cuda_fp16.h>
+
 namespace hp {
 namespace fs = std::filesystem;
 
@@ -21,6 +28,87 @@ class BuildLogger : public nvinfer1::ILogger {
     if (severity <= Severity::kERROR) std::fprintf(stderr, "[TRT] %s\n", msg);
   }
 };
+
+uint16_t to_half_bits(float f) {  // round to nearest even, as __float2half
+  const __half h = __float2half_rn(f);
+  uint16_t b;
+  std::memcpy(&b, &h, sizeof b);
+  return b;
+}
+
+bool in_scopes(const nvinfer1::ILayer *l, const std::vector<std::string> &scopes) {
+  const std::string_view n = l->getName();
+  for (const std::string &s : scopes)
+    if (n.find(s) != std::string_view::npos) return true;
+  return false;
+}
+
+bool is_float(nvinfer1::DataType t) { return t == nvinfer1::DataType::kFLOAT || t == nvinfer1::DataType::kHALF; }
+
+// Runs the layers of `scopes` in FP16 only (PlanSpec::fp16_scopes). Every float->float cast
+// whose input comes from a layer in scope is bypassed (its consumers read the cast's input; the
+// builder drops the dead cast), and each FP32 constant read by an element-wise layer in scope,
+// possibly through broadcast shuffles, is replaced by its FP16 rounding. `store` keeps the FP16
+// weights alive until the build is done. Returns the number of casts bypassed.
+int strip_casts(nvinfer1::INetworkDefinition &net, const std::vector<std::string> &scopes,
+                std::vector<std::vector<uint16_t>> &store) {
+  using nvinfer1::ILayer;
+  using nvinfer1::LayerType;
+  std::unordered_map<const nvinfer1::ITensor *, ILayer *> producer;
+  std::unordered_map<const nvinfer1::ITensor *, std::vector<std::pair<ILayer *, int>>> consumers;
+  for (int i = 0; i < net.getNbLayers(); ++i) {
+    ILayer *l = net.getLayer(i);
+    for (int k = 0; k < l->getNbOutputs(); ++k) producer[l->getOutput(k)] = l;
+    for (int k = 0; k < l->getNbInputs(); ++k)
+      if (l->getInput(k)) consumers[l->getInput(k)].push_back({l, k});
+  }
+  std::unordered_set<const nvinfer1::ITensor *> outputs;
+  for (int i = 0; i < net.getNbOutputs(); ++i) outputs.insert(net.getOutput(i));
+
+  int bypassed = 0;
+  for (int i = 0; i < net.getNbLayers(); ++i) {
+    ILayer *l = net.getLayer(i);
+    if (l->getType() != LayerType::kCAST || !in_scopes(l, scopes)) continue;
+    nvinfer1::ITensor *in = l->getInput(0), *out = l->getOutput(0);
+    auto *cast = static_cast<nvinfer1::ICastLayer *>(l);
+    const auto p = producer.find(in);
+    if (!is_float(cast->getToType()) || !is_float(in->getType()) || p == producer.end() ||
+        !in_scopes(p->second, scopes) || outputs.contains(out))
+      continue;
+    for (auto [c, k] : consumers[out]) {
+      c->setInput(k, *in);
+      consumers[in].push_back({c, k});
+    }
+    consumers[out].clear();
+    ++bypassed;
+  }
+
+  std::unordered_set<ILayer *> converted;
+  for (int i = 0; i < net.getNbLayers(); ++i) {
+    ILayer *l = net.getLayer(i);
+    if (l->getType() != LayerType::kELEMENTWISE || !in_scopes(l, scopes)) continue;
+    for (int k = 0; k < l->getNbInputs(); ++k) {
+      ILayer *src = nullptr;
+      for (auto it = producer.find(l->getInput(k)); it != producer.end(); it = producer.find(it->second->getInput(0))) {
+        if (it->second->getType() == LayerType::kCONSTANT) {
+          src = it->second;
+          break;
+        }
+        if (it->second->getType() != LayerType::kSHUFFLE) break;
+      }
+      if (!src || converted.contains(src)) continue;
+      auto *c = static_cast<nvinfer1::IConstantLayer *>(src);
+      const nvinfer1::Weights w = c->getWeights();
+      if (w.type != nvinfer1::DataType::kFLOAT) continue;
+      std::vector<uint16_t> &h = store.emplace_back(static_cast<size_t>(w.count));
+      const float *f = static_cast<const float *>(w.values);
+      for (int64_t j = 0; j < w.count; ++j) h[j] = to_half_bits(f[j]);
+      c->setWeights({nvinfer1::DataType::kHALF, h.data(), w.count});
+      converted.insert(src);
+    }
+  }
+  return bypassed;
+}
 
 nvinfer1::Dims to_dims(const std::vector<int64_t> &v) {
   nvinfer1::Dims d{};
@@ -95,8 +183,14 @@ std::vector<PlanSpec> make_specs() {
   for (const auto &g : graphs) rec.profiles.push_back({fixed("x", {g[0], 3, 48, g[1]})});
   s.push_back(rec);
   // D-FINE layout: batch 1 (fastest here, smallest arena), fixed 960 letterbox.
-  s.push_back({"dfine_960_fp16.onnx", "dfine_960_fp16.plan", ModelGroup::kLayout,
-               {{fixed("images", {1, 3, 960, 960})}}});
+  //
+  // Its ONNX keeps every backbone BatchNorm / learnable-affine op in FP32 between FP16 convs:
+  // 120 casts, which also block conv+BN fusion. Built with the backbone wholly FP16: 12.0 -> 7.7
+  // ms per page on the RTX 4050 (see the commit for the layout agreement and benchmarks).
+  PlanSpec dfine{"dfine_960_fp16.onnx", "dfine_960_fp16bb.plan", ModelGroup::kLayout,
+                 {{fixed("images", {1, 3, 960, 960})}}};
+  dfine.fp16_scopes = {"/model/backbone/"};
+  s.push_back(dfine);
   // PP-FormulaNet-S: FP32 encoder + prep, FP16 decoder step (see src/formula.cu), batch <= 8.
   const int64_t B = 8;
   s.push_back({"formula/encoder.onnx", "formula/encoder.plan", ModelGroup::kFormula,
@@ -180,6 +274,9 @@ void build_plan(const PlanSpec &spec, const std::string &onnx_dir, const std::st
     net->unmarkOutput(*net->getOutput(0));
     net->markOutput(*softmax->getInput(0));
   }
+  std::vector<std::vector<uint16_t>> fp16_weights;  // referenced by the network until the build ends
+  if (!spec.fp16_scopes.empty() && strip_casts(*net, spec.fp16_scopes, fp16_weights) == 0)
+    throw std::runtime_error("no FP32 casts to strip in " + onnx);
   std::unique_ptr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
   cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, static_cast<size_t>(spec.workspace_gb * (1ull << 30)));
   for (const Profile &p : spec.profiles) {
