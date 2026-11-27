@@ -395,6 +395,7 @@ std::string plan_source_key(const PlanSpec &s, const fs::path &onnx_dir) {
       if (f.at("path") == s.onnx) sha = f.at("sha256").get<std::string>();
   if (sha.empty() && fs::exists(onnx_dir / s.onnx)) sha = sha256_file(onnx_dir / s.onnx);
   std::string key = sha + " ws=" + std::to_string(s.workspace_gb);
+  if (s.host_shapes) key += " host_shapes";
   for (const Profile &p : s.profiles) {
     key += " |";
     for (const InputRange &r : p) {
@@ -448,8 +449,13 @@ void ensure_engines(const fs::path &onnx_dir, const fs::path &plan_dir, ModelNee
     ::flock(lock, LOCK_EX);
   }
   std::vector<const PlanSpec *> todo;
+  // Missing plans, and plans built from another ONNX or other profiles than hp's (per their .src).
+  auto stale = [&](const PlanSpec &s) {
+    const fs::path src = plan_dir / (s.plan + ".src");
+    return fs::exists(src) && read_text(src) != plan_source_key(s, onnx_dir);
+  };
   for (const PlanSpec &s : plan_specs())
-    if (needed(s, needs) && !fs::exists(plan_dir / s.plan) && !(s.optional && !fs::exists(onnx_dir / s.onnx)))
+    if (needed(s, needs) && (!fs::exists(plan_dir / s.plan) || stale(s)) && !(s.optional && !fs::exists(onnx_dir / s.onnx)))
       todo.push_back(&s);
   if (!todo.empty())
     std::fprintf(stderr, "preparing %zu TensorRT engine(s) with TensorRT %s in %s (one-time; minutes)\n", todo.size(),

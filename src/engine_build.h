@@ -27,6 +27,9 @@ struct PlanSpec {
   std::string variant = {};  // precision variant ("fp16", "int8") for models that have several; "" = the only one
   // Built and loaded only when its ONNX is in the models dir (a model the HF repo may not carry yet).
   bool optional = false;
+  // Shape-vector scatters rewritten as slices + concat, so that every shape is known on the host
+  // and enqueueV3 neither waits for the GPU nor breaks CUDA graph capture (engine_build.cpp).
+  bool host_shapes = false;
 };
 
 // LayoutNet (OCRia-nano-1's tablenet) and OrderNet (Indra OCR's order) come in reduced-precision

@@ -31,6 +31,49 @@ nvinfer1::Dims to_dims(const std::vector<int64_t> &v) {
 
 InputRange fixed(const std::string &name, std::vector<int64_t> shape) { return {name, shape, shape, shape}; }
 
+// torch's export of expand() sets one entry of a shape vector with ScatterElements(shape, [k],
+// [v]). TensorRT has no shape-tensor scatter, so it treats the expand as data-dependent: each
+// enqueueV3 computes the vector on the GPU, copies it back and synchronizes (the formula step:
+// 4 of them per step, every step waiting for the GPU, and behind other streams' kernels when the
+// GPU is shared). The same vector as shape[:k] ++ v ++ shape[k+1:] stays on the host. Only
+// index arithmetic changes: the formula step's tokens are the same (arxiv100: 321/321).
+void fold_shape_scatters(nvinfer1::INetworkDefinition &net) {
+  for (int l = 0; l < net.getNbLayers(); ++l) {
+    nvinfer1::ILayer *layer = net.getLayer(l);
+    if (layer->getType() != nvinfer1::LayerType::kSCATTER) continue;
+    auto *sc = static_cast<nvinfer1::IScatterLayer *>(layer);
+    nvinfer1::ITensor *data = sc->getInput(0), *idx = sc->getInput(1), *upd = sc->getInput(2), *out = sc->getOutput(0);
+    if (sc->getMode() != nvinfer1::ScatterMode::kELEMENT || !out->isShapeTensor() || data->getDimensions().nbDims != 1 ||
+        idx->getDimensions().nbDims != 1 || idx->getDimensions().d[0] != 1 || upd->getDimensions().nbDims != 1)
+      continue;
+    const int64_t n = data->getDimensions().d[0];
+    int64_t k = -1;
+    for (int c = 0; c < net.getNbLayers(); ++c) {
+      nvinfer1::ILayer *cl = net.getLayer(c);
+      if (cl->getType() != nvinfer1::LayerType::kCONSTANT || cl->getOutput(0) != idx) continue;
+      const nvinfer1::Weights w = static_cast<nvinfer1::IConstantLayer *>(cl)->getWeights();
+      if (w.count == 1 && w.type == nvinfer1::DataType::kINT64) k = *static_cast<const int64_t *>(w.values);
+      if (w.count == 1 && w.type == nvinfer1::DataType::kINT32) k = *static_cast<const int32_t *>(w.values);
+    }
+    if (k < 0) k += n;
+    if (n <= 0 || k < 0 || k >= n) continue;
+    std::vector<nvinfer1::ITensor *> parts;
+    auto dims1 = [](int64_t v) { nvinfer1::Dims d{}; d.nbDims = 1; d.d[0] = v; return d; };
+    if (k > 0) parts.push_back(net.addSlice(*data, dims1(0), dims1(k), dims1(1))->getOutput(0));
+    parts.push_back(upd);
+    if (k + 1 < n) parts.push_back(net.addSlice(*data, dims1(k + 1), dims1(n - k - 1), dims1(1))->getOutput(0));
+    nvinfer1::IConcatenationLayer *cat = net.addConcatenation(parts.data(), static_cast<int32_t>(parts.size()));
+    cat->setAxis(0);
+    nvinfer1::ITensor *repl = cat->getOutput(0);
+    for (int u = 0; u < net.getNbLayers(); ++u) {
+      nvinfer1::ILayer *user = net.getLayer(u);
+      if (user == cat) continue;
+      for (int i = 0; i < user->getNbInputs(); ++i)
+        if (user->getInput(i) == out) user->setInput(i, *repl);
+    }
+  }
+}
+
 std::vector<PlanSpec> make_specs() {
   std::vector<PlanSpec> s;
   // PP-OCR det: dynamic up to 1600 (multi_resize emits <= 1280 by default; 1600 leaves room).
@@ -61,7 +104,7 @@ std::vector<PlanSpec> make_specs() {
                  {"vb", kv(1), kv(B), kv(B)},
                  {"ck", ckv(1), ckv(B), ckv(B)},
                  {"cv", ckv(1), ckv(B), ckv(B)}}},
-               3.0});
+               3.0, {}, false, true});
   // LayoutNet, FP16 (autocast; attention masks -3e4 instead of -1e9 so they fit) or INT8 (Q/DQ,
   // rest FP16). Units 2..1500 (pages with more skip the model, as the reference does).
   // OmniDocBench table pages, CPU reference: TEDS FP32 0.511, FP16 0.511, INT8 0.498.
@@ -120,6 +163,7 @@ void build_plan(const PlanSpec &spec, const std::string &onnx_dir, const std::st
     for (int i = 0; i < parser->getNbErrors(); ++i) err += std::string("\n  ") + parser->getError(i)->desc();
     throw std::runtime_error(err);
   }
+  if (spec.host_shapes) fold_shape_scatters(*net);
   std::unique_ptr<nvinfer1::IBuilderConfig> cfg(builder->createBuilderConfig());
   cfg->setMemoryPoolLimit(nvinfer1::MemoryPoolType::kWORKSPACE, static_cast<size_t>(spec.workspace_gb * (1ull << 30)));
   for (const Profile &p : spec.profiles) {
