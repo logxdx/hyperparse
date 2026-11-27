@@ -10,6 +10,7 @@
 
 #include <cuda_runtime.h>
 
+#include "cuda_raii.h"
 #include "multi_resize.h"
 #include "core/common/cuda/cuda_ptr.h"
 #include "core/common/geometry/box.h"
@@ -32,12 +33,20 @@ class TextDet {
   // Full-page det scale for a page (what resize_spec would use), for region packing.
   [[nodiscard]] float page_scale(int page_w, int page_h) const;
 
-  // Execute + postprocess on `stream`; syncs the stream once (box count/coords D2H).
-  [[nodiscard]] std::vector<hp::core::Box> run(cudaStream_t stream);
+  // Execute + postprocess + box D2H on `stream`, no host wait. One det in flight:
+  // collect() it before the next enqueue() (or canvas_input/resize_spec input write).
+  void enqueue(cudaStream_t stream);
+  // Waits for the enqueued det; boxes in page px (canvas px for canvas_input).
+  [[nodiscard]] std::vector<hp::core::Box> collect();
+  [[nodiscard]] std::vector<hp::core::Box> run(cudaStream_t stream) {
+    enqueue(stream);
+    return collect();
+  }
 
  private:
   int max_side_ = 1280;
   int page_w_ = 0, page_h_ = 0, in_w_ = 0, in_h_ = 0;
+  int run_w_ = 0, run_h_ = 0, run_page_w_ = 0, run_page_h_ = 0;  // geometry of the det in flight
   hp::core::detection::DbParams db_{};
   std::unique_ptr<hp::core::engine::TrtEngine> engine_;
 
@@ -48,7 +57,9 @@ class TextDet {
   hp::core::CudaPtr<uint32_t> d_jfa_labels_, d_jfa_seeds_, d_jfa_seeds_alt_;
   hp::core::CudaPtr<float> d_expand_, d_orient_;
   hp::core::CudaPtr<unsigned long long> d_moments_;
-  hp::core::CudaHostPtr<hp::core::kernels::GpuDetBox> h_boxes_, h_exp_boxes_;
+  hp::core::CudaHostPtr<hp::core::kernels::GpuDetBox> h_exp_boxes_;
+  hp::core::CudaHostPtr<int> h_count_;  // components labelled (pre-filter)
+  CudaEvent done_;                      // end of the enqueued det
 };
 
 }  // namespace hp

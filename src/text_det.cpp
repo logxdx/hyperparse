@@ -66,7 +66,7 @@ bool TextDet::load(const std::string &plan_path, int max_side,
   d_perim_ = CudaPtr<int>(kMaxGpuComponents);
   d_moments_ = CudaPtr<unsigned long long>(kMaxGpuComponents * 6);
   d_orient_ = CudaPtr<float>(kMaxGpuComponents * 6);
-  h_boxes_ = CudaHostPtr<GpuDetBox>(kMaxGpuComponents);
+  h_count_ = CudaHostPtr<int>(1);
   h_exp_boxes_ = CudaHostPtr<GpuDetBox>(kMaxGpuComponents);
   engine_->bind_io(d_in_.get(), d_pred_.get());
   return true;
@@ -91,7 +91,7 @@ float TextDet::page_scale(int page_w, int page_h) const {
   return static_cast<float>(std::min(1.0, static_cast<double>(max_side_) / std::max(page_w, page_h)));
 }
 
-std::vector<Box> TextDet::run(cudaStream_t stream) {
+void TextDet::enqueue(cudaStream_t stream) {
   namespace k = hp::core::kernels;
   nvinfer1::Dims d{};
   d.nbDims = 4;
@@ -101,16 +101,20 @@ std::vector<Box> TextDet::run(cudaStream_t stream) {
   d.d[3] = in_w_;
   if (!engine_->infer_dynamic(d, stream)) throw std::runtime_error("det execute failed");
   const int w = in_w_, h = in_h_;
+  run_w_ = w;
+  run_h_ = h;
+  run_page_w_ = page_w_;
+  run_page_h_ = page_h_;
   k::cuda_threshold_to_u8(d_pred_.get(), d_bitmap_.get(), w, h, db_.thresh, stream);
-
-  int n_boxes = 0, n_total = 0;
   k::cuda_gpu_ccl_detect(d_bitmap_.get(), d_pred_.get(), w, h, db_.box_thresh, d_labels_.get(),
                          d_compact_ids_.get(), d_id_counter_.get(), d_bboxes_.get(),
-                         d_num_boxes_.get(), h_boxes_.get(), &n_boxes, stream, &n_total);
-  std::vector<Box> boxes;
-  const int slots = std::min(n_total, kMaxGpuComponents);
-  if (n_boxes == 0 || slots == 0) return boxes;
-
+                         d_num_boxes_.get(), nullptr, nullptr, stream);
+  // The component count stays on the device: every kernel below covers all
+  // kMaxGpuComponents slots. Slots past the page's count hold the CCL init
+  // values (no pixels), so they get expand 0 and no label, and collect() reads
+  // only the first min(count, kMaxGpuComponents) slots: the boxes are the same
+  // as with the count read back first, without a host round trip mid-det.
+  constexpr int slots = kMaxGpuComponents;
   k::cuda_accumulate_crack_perimeter(d_compact_ids_.get(), d_bitmap_.get(), w, h, slots,
                                      d_perim_.get(), stream);
   k::cuda_compute_expand_per_comp(d_bboxes_.get(), d_perim_.get(), slots, db_.unclip_ratio,
@@ -122,13 +126,19 @@ std::vector<Box> TextDet::run(cudaStream_t stream) {
   GpuDetBox *exp = d_bboxes_.get() + kMaxGpuComponents;
   k::cuda_jfa_extract_oriented(d_jfa_labels_.get(), w, h, exp, slots, d_moments_.get(),
                                d_orient_.get(), stream);
+  CUDA_CHECK(cudaMemcpyAsync(h_count_.get(), d_id_counter_.get(), sizeof(int), cudaMemcpyDeviceToHost, stream));
   CUDA_CHECK(cudaMemcpyAsync(h_exp_boxes_.get(), exp, slots * sizeof(GpuDetBox),
                              cudaMemcpyDeviceToHost, stream));
-  CUDA_CHECK(cudaStreamSynchronize(stream));
+  CUDA_CHECK(cudaEventRecord(done_, stream));
+}
 
+std::vector<Box> TextDet::collect() {
+  CUDA_CHECK(cudaEventSynchronize(done_));
+  const int w = run_w_, h = run_h_, page_w = run_page_w_, page_h = run_page_h_;
+  const int slots = std::min(*h_count_.get(), kMaxGpuComponents);
+  std::vector<Box> boxes;
   // Det input is the whole page resized (no pad), so content == input size.
-  const float rw = static_cast<float>(w) / page_w_, rh = static_cast<float>(h) / page_h_;
-  boxes.reserve(n_boxes);
+  const float rw = static_cast<float>(w) / page_w, rh = static_cast<float>(h) / page_h;
   for (int i = 0; i < slots; ++i) {
     const GpuDetBox &eb = h_exp_boxes_.get()[i];
     if (eb.pixel_count < 9) continue;
@@ -142,8 +152,8 @@ std::vector<Box> TextDet::run(cudaStream_t stream) {
     order_quad(px, py);
     Box b;
     for (int q = 0; q < 4; ++q)
-      b[q] = {std::clamp(static_cast<int>(std::lround(px[q] / rw)), 0, page_w_ - 1),
-              std::clamp(static_cast<int>(std::lround(py[q] / rh)), 0, page_h_ - 1)};
+      b[q] = {std::clamp(static_cast<int>(std::lround(px[q] / rw)), 0, page_w - 1),
+              std::clamp(static_cast<int>(std::lround(py[q] / rh)), 0, page_h - 1)};
     auto len = [](const std::array<int, 2> &a, const std::array<int, 2> &c) {
       return static_cast<int>(std::sqrt(double((a[0] - c[0]) * (a[0] - c[0]) +
                                                (a[1] - c[1]) * (a[1] - c[1]))));

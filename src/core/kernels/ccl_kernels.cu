@@ -461,6 +461,10 @@ int cuda_gpu_ccl_detect(
       d_compact_ids, d_pred_map, d_bboxes, w, h, total);
   CUDA_CHECK(cudaGetLastError());
 
+  // Labelling only: compact_ids, d_id_counter and the per-component boxes stay
+  // on the device for the caller's next kernels; no filter, no host wait.
+  if (h_boxes == nullptr) return 0;
+
   // Step 7: Filter (launch kMaxGpuComponents threads -- no CPU read needed)
   CUDA_CHECK(cudaMemsetAsync(d_num_boxes, 0, sizeof(int), stream));
   GpuDetBox *d_out_bboxes = d_bboxes + kMaxGpuComponents;

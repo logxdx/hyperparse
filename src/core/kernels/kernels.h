@@ -144,6 +144,8 @@ static constexpr int kMaxGpuComponents = 3000;
 //   d_num_boxes:    int[1]                        -- output count
 //
 // h_boxes must point to at least kMaxGpuComponents GpuDetBox entries (pinned).
+// h_boxes == nullptr: labelling only (steps up to bbox extraction), no filter,
+// no copy and no stream sync; returns 0.
 int cuda_gpu_ccl_detect(
     const uint8_t *d_bitmap,     // binary bitmap (255=fg, 0=bg)
     const float *d_pred_map,     // raw probability map
