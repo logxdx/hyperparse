@@ -135,7 +135,7 @@ void print_stats(const hp::ParseStats &s) {
                "  GPU thread: OCR %.1f ms per OCR page (det+filter %.1f, rec %.1f), host wait on layout %.1f ms/page, "
                "assembly %.2f ms/page\n"
                "  region-only det on %d partial pages (mean canvas %.2f MP); %d text-layer boxes recognised without det\n"
-               "  formulas: %d recognised in %d batches, %.1f ms each on the assembly thread (%d decode steps)\n"
+               "  formulas: %d recognised in %d batches, %.1f ms each on the assembly thread (%d decode steps of 8)\n"
                "  tables: LayoutNet on %d pages with Table regions, %d tables, %.1f ms per page on the assembly thread\n"
                "  reading order: OrderNet on %d pages, %.1f ms per page on the assembly thread (with Markdown)\n"
                "  bound: GPU thread waited %.0f ms for renders (%.0f%% of wall); assembly busy %.0f ms (%.0f%%), "

@@ -15,7 +15,7 @@ namespace hp {
 namespace {
 
 // ── constants (PP-FormulaNet-S) ──────────────────────────────────────────────
-constexpr int H = 16, Dh = 24, CTX = 144, VOCAB = 50000, MAXLEN = 1056, MAXIT = 342, CHECK = 16;
+constexpr int H = 16, Dh = 24, CTX = 144, VOCAB = 50000, MAXLEN = 1056, MAXIT = 342;
 constexpr int MEMD = 2048;
 constexpr float kMean = 0.7931f, kStd = 0.1738f, kPad = (0.0f - kMean) / kStd;
 
@@ -97,8 +97,15 @@ void pil_resize(const uint8_t *src, size_t step, int sw, int sh, int nw, int nh,
 }
 
 // ── decode kernels ──────────────────────────────────────────────────────────
-__global__ void argmax_rows(const float *__restrict__ lg, int64_t *__restrict__ next, int64_t *__restrict__ hist,
-                            int64_t *__restrict__ tok, int V) {
+// Cohort row decoded in each slot of a step batch (-1: empty).
+struct Rows {
+  int r[FormulaRecognizer::kBatch];
+};
+
+// Greedy pick per (slot, token): the next input token of the slot and, for a live slot, its
+// cohort row's history; an EOS marks the row done in `done` (pinned host memory).
+__global__ void argmax_rows(const float *__restrict__ lg, int64_t *__restrict__ tok, int64_t *__restrict__ hist,
+                            Rows rows, int it, int64_t eos, int *done, int V) {
   const int row = blockIdx.x;
   const float *p = lg + (size_t)row * V;
   float m = -1e30f;
@@ -124,16 +131,15 @@ __global__ void argmax_rows(const float *__restrict__ lg, int64_t *__restrict__ 
       const int oi = __shfl_down_sync(0xffffffffu, mi, s);
       if (ov > m || (ov == m && oi < mi)) { m = ov; mi = oi; }
     }
-    if (lane == 0) { next[row] = mi; hist[row] = mi; tok[row] = mi; }
+    if (lane == 0) {
+      tok[row] = mi;
+      const int r = rows.r[row / 3];
+      if (r >= 0) {
+        hist[((size_t)r * MAXIT + it) * 3 + row % 3] = mi;
+        if (mi == eos) *(volatile int *)(done + r) = 1;
+      }
+    }
   }
-}
-
-__global__ void scan_eos(const int64_t *all, unsigned char *done, int B, int64_t eos, int s0, int s1) {
-  const int b = blockIdx.x * blockDim.x + threadIdx.x;
-  if (b >= B || done[b]) return;
-  for (int s = s0; s < s1; ++s)
-    for (int j = 0; j < 3; ++j)
-      if (all[((size_t)s * B + b) * 3 + j] == eos) { done[b] = 1; return; }
 }
 
 nvinfer1::Dims dims(std::initializer_list<int64_t> v) {
@@ -142,6 +148,32 @@ nvinfer1::Dims dims(std::initializer_list<int64_t> v) {
   int i = 0;
   for (auto x : v) d.d[i++] = x;
   return d;
+}
+
+constexpr int B = FormulaRecognizer::kBatch, G = FormulaRecognizer::kGroups;
+constexpr size_t kX = (size_t)kFormulaS * kFormulaS, kMem = (size_t)CTX * MEMD;
+constexpr size_t kKvRow = (size_t)H * MAXLEN * Dh, kKv = 2 * B * kKvRow;    // [2, B, H, MAXLEN, Dh]
+constexpr size_t kCkvRow = (size_t)H * CTX * Dh, kCkv = 2 * B * kCkvRow;   // [2, B, H, CTX, Dh]
+
+// Dark pixels of a crop (as the ink trim counts them): the cohort sort key, ~ formula length.
+int ink_pixels(const FormulaCrop &c) {
+  int mn = 255, mx = 0;
+  auto gray = [&](int x, int y) {
+    const uint8_t *p = c.bgr + (size_t)y * c.step + x * 3;
+    return (p[0] * 1868 + p[1] * 9617 + p[2] * 4899 + (1 << 13)) >> 14;
+  };
+  for (int y = 0; y < c.h; ++y)
+    for (int x = 0; x < c.w; ++x) {
+      const int g = gray(x, y);
+      mn = std::min(mn, g);
+      mx = std::max(mx, g);
+    }
+  if (mx <= mn) return 0;
+  const int thr = mn + (200 * (mx - mn) + 254) / 255;  // (g - mn) * 255 / (mx - mn) < 200
+  int n = 0;
+  for (int y = 0; y < c.h; ++y)
+    for (int x = 0; x < c.w; ++x) n += gray(x, y) < thr;
+  return n;
 }
 
 }  // namespace
@@ -203,115 +235,199 @@ bool FormulaRecognizer::load(const std::string &dir) {
   tok_ = hp::core::formula::FormulaTokenizer::load(dir + "/tokenizer.json");
   if (!tok_) return false;
   enc_out_ = enc_->output_names().at(0);
-  const int B = kMaxBatch;
-  const size_t kv = (size_t)2 * B * H * MAXLEN * Dh, ckv = (size_t)2 * B * H * CTX * Dh;
-  h_x_ = hp::core::CudaHostPtr<float>((size_t)kFormulaS * kFormulaS);
-  d_x_ = hp::core::CudaPtr<float>((size_t)kFormulaS * kFormulaS);
-  d_mem_ = hp::core::CudaPtr<float>((size_t)B * CTX * MEMD);
-  d_ck_ = hp::core::CudaPtr<float>(ckv);
-  d_cv_ = hp::core::CudaPtr<float>(ckv);
-  d_kA_ = hp::core::CudaPtr<float>(kv);
-  d_kB_ = hp::core::CudaPtr<float>(kv);
-  d_vA_ = hp::core::CudaPtr<float>(kv);
-  d_vB_ = hp::core::CudaPtr<float>(kv);
+  h_x_ = hp::core::CudaHostPtr<float>(2 * B * kX);
+  h_eos_ = hp::core::CudaHostPtr<int>(kCohort);
+  d_x_ = hp::core::CudaPtr<float>(B * kX);
+  d_mem_ = hp::core::CudaPtr<float>(B * kMem);
+  d_ckv_ = hp::core::CudaPtr<float>(2 * G * 2 * kCkv);  // [set][group][ck, cv]
+  d_kv_ = hp::core::CudaPtr<float>((G + 1) * 2 * kKv);  // [buffer][k, v]: a group's KV + one to step into
   d_logits_ = hp::core::CudaPtr<float>((size_t)B * 3 * VOCAB);
-  d_tok_ = hp::core::CudaPtr<int64_t>((size_t)B * 3);
-  d_all_ = hp::core::CudaPtr<int64_t>((size_t)MAXIT * B * 3);
-  d_done_ = hp::core::CudaPtr<unsigned char>(B);
+  d_tok_ = hp::core::CudaPtr<int64_t>((size_t)G * B * 3);
+  d_hist_ = hp::core::CudaPtr<int64_t>((size_t)kCohort * MAXIT * 3);
   std::vector<int64_t> pos(MAXIT);
   for (int i = 0; i < MAXIT; ++i) pos[i] = 3LL * i;
   d_pos_ = hp::core::CudaPtr<int64_t>(MAXIT);
   CUDA_CHECK(cudaMemcpy(d_pos_.get(), pos.data(), MAXIT * sizeof(int64_t), cudaMemcpyHostToDevice));
-  return true;
+  // Every launch is at batch kBatch (see formula.h): the shapes never change.
+  return enc_->set_input_shape("x", dims({1, 1, kFormulaS, kFormulaS})) &&
+         prep_->set_input_shape("memory", dims({B, CTX, MEMD})) && step_->set_input_shape("tokens", dims({B, 3})) &&
+         step_->set_input_shape("pos", dims({1})) && step_->set_input_shape("kb", dims({2, B, H, MAXLEN, Dh})) &&
+         step_->set_input_shape("vb", dims({2, B, H, MAXLEN, Dh})) &&
+         step_->set_input_shape("ck", dims({2, B, H, CTX, Dh})) && step_->set_input_shape("cv", dims({2, B, H, CTX, Dh}));
 }
 
-void FormulaRecognizer::decode_chunk(int B, std::vector<std::vector<int64_t>> &out, cudaStream_t s) {
-  const int64_t eos = tok_->eos_id();
-  const size_t kvb = (size_t)2 * B * H * MAXLEN * Dh * sizeof(float);
-  CUDA_CHECK(cudaMemsetAsync(d_kA_.get(), 0, kvb, s));
-  CUDA_CHECK(cudaMemsetAsync(d_vA_.get(), 0, kvb, s));
-  CUDA_CHECK(cudaMemsetAsync(d_tok_.get(), 0, (size_t)B * 3 * sizeof(int64_t), s));  // <s> = 0
-  CUDA_CHECK(cudaMemsetAsync(d_done_.get(), 0, B, s));
-  float *kin = d_kA_.get(), *kout = d_kB_.get(), *vin = d_vA_.get(), *vout = d_vB_.get();
-  if (!step_->set_input_shape("tokens", dims({B, 3})) || !step_->set_input_shape("pos", dims({1})) ||
-      !step_->set_input_shape("kb", dims({2, B, H, MAXLEN, Dh})) || !step_->set_input_shape("vb", dims({2, B, H, MAXLEN, Dh})) ||
-      !step_->set_input_shape("ck", dims({2, B, H, CTX, Dh})) || !step_->set_input_shape("cv", dims({2, B, H, CTX, Dh})))
-    throw std::runtime_error("formula step: bad shape");
-  step_->set_tensor_address("tokens", d_tok_.get());
-  step_->set_tensor_address("ck", d_ck_.get());
-  step_->set_tensor_address("cv", d_cv_.get());
-  step_->set_tensor_address("logits", d_logits_.get());
-  std::vector<unsigned char> done(B, 0);
-  int last = MAXIT, checked = 0;
-  for (int it = 0; it < MAXIT; ++it) {
-    step_->set_tensor_address("pos", d_pos_.get() + it);
-    step_->set_tensor_address("kb", kin);
-    step_->set_tensor_address("vb", vin);
-    step_->set_tensor_address("kb_out", kout);
-    step_->set_tensor_address("vb_out", vout);
-    if (!step_->execute(s)) throw std::runtime_error("formula step failed");
-    int64_t *hist = d_all_.get() + (size_t)it * B * 3;
-    argmax_rows<<<B * 3, 256, 0, s>>>(d_logits_.get(), hist, hist, d_tok_.get(), VOCAB);
-    std::swap(kin, kout);
-    std::swap(vin, vout);
-    ++steps_run;
-    if ((it + 1) % CHECK == 0) {
-      scan_eos<<<(B + 63) / 64, 64, 0, s>>>(d_all_.get(), d_done_.get(), B, eos, checked, it + 1);
-      CUDA_CHECK(cudaMemcpyAsync(done.data(), d_done_.get(), B, cudaMemcpyDeviceToHost, s));
-      CUDA_CHECK(cudaStreamSynchronize(s));
-      checked = it + 1;
-      if (std::all_of(done.begin(), done.end(), [](unsigned char d) { return d != 0; })) { last = it + 1; break; }
-    }
+void FormulaRecognizer::encode_step(const std::vector<FormulaCrop> &crops, const std::vector<int> &order,
+                                    EncodeJob &job) {
+  const int i = job.next, g = i / B, b = i % B;
+  float *ck = d_ckv_.get() + (size_t)(job.set * G + g) * 2 * kCkv;
+  if (b == 0) {  // a new step batch: the other pinned half, once its uploads are done
+    x_half_ ^= 1;
+    CUDA_CHECK(cudaEventSynchronize(x_free_[x_half_]));
+    if (i == 0) CUDA_CHECK(cudaStreamWaitEvent(enc_stream_, set_free_[job.set]));  // the set's last decode is over
   }
-  std::vector<int64_t> hall((size_t)last * B * 3);
-  CUDA_CHECK(cudaMemcpyAsync(hall.data(), d_all_.get(), hall.size() * sizeof(int64_t), cudaMemcpyDeviceToHost, s));
+  const int ci = order[job.c0 + i];
+  const FormulaCrop &c = crops[ci];
+  float *x = h_x_.get() + (x_half_ * B + b) * kX;
+  formula_preprocess(c.bgr, c.step, c.w, c.h, x);
+  if (!dump_dir.empty()) {
+    const std::string id = std::to_string(dump_n + ci);
+    std::ofstream(dump_dir + "/x_" + id + ".f32", std::ios::binary)
+        .write(reinterpret_cast<const char *>(x), sizeof(float) * kX);
+    std::ofstream cf(dump_dir + "/c_" + id + ".bgr", std::ios::binary);
+    const int32_t wh[2] = {c.w, c.h};
+    cf.write(reinterpret_cast<const char *>(wh), sizeof wh);
+    for (int y = 0; y < c.h; ++y) cf.write(reinterpret_cast<const char *>(c.bgr + (size_t)y * c.step), (size_t)c.w * 3);
+  }
+  CUDA_CHECK(cudaMemcpyAsync(d_x_.get() + b * kX, x, sizeof(float) * kX, cudaMemcpyHostToDevice, enc_stream_));
+  enc_->set_tensor_address("x", d_x_.get() + b * kX);
+  enc_->set_tensor_address(enc_out_, d_mem_.get() + b * kMem);
+  if (!enc_->execute(enc_stream_)) throw std::runtime_error("formula encoder failed");
+  ++job.next;
+  if (b == B - 1 || job.done()) {  // the step batch is complete: cross-KV prep
+    CUDA_CHECK(cudaEventRecord(x_free_[x_half_], enc_stream_));
+    for (int r = b + 1; r < B; ++r)  // empty slots: row 0's memory (never read back)
+      CUDA_CHECK(cudaMemcpyAsync(d_mem_.get() + r * kMem, d_mem_.get(), sizeof(float) * kMem,
+                                 cudaMemcpyDeviceToDevice, enc_stream_));
+    prep_->set_tensor_address("memory", d_mem_.get());
+    prep_->set_tensor_address("ck", ck);
+    prep_->set_tensor_address("cv", ck + kCkv);
+    if (!prep_->execute(enc_stream_)) throw std::runtime_error("formula prep failed");
+    if (job.done()) CUDA_CHECK(cudaEventRecord(set_ready_[job.set], enc_stream_));
+  }
+}
+
+void FormulaRecognizer::decode_cohort(int n, int set, std::vector<std::vector<int64_t>> &toks, cudaStream_t s,
+                                      const std::vector<FormulaCrop> &crops, const std::vector<int> &order,
+                                      EncodeJob &next) {
+  const int64_t eos = tok_->eos_id();
+  struct Group {
+    int slot;  // its cross-KV and next tokens: d_ckv_ set/slot, d_tok_ slot
+    int kv;    // its self-attention KV: d_kv_ buffer
+    Rows rows;
+    [[nodiscard]] int live() const { return (int)std::count_if(rows.r, rows.r + B, [](int r) { return r >= 0; }); }
+  };
+  auto kv = [&](int buf) { return d_kv_.get() + (size_t)buf * 2 * kKv; };  // v at + kKv
+  auto ckv = [&](int slot) { return d_ckv_.get() + (size_t)(set * G + slot) * 2 * kCkv; };  // cv at + kCkv
+  auto tok = [&](int slot) { return d_tok_.get() + (size_t)slot * B * 3; };
+  volatile int *done = h_eos_.get();
+  for (int i = 0; i < n; ++i) done[i] = 0;  // the previous cohort's kernels are over (its decode synced)
+
+  CUDA_CHECK(cudaStreamWaitEvent(s, set_ready_[set]));
+  std::vector<Group> gs;
+  std::vector<int> spare;  // KV buffers no group holds
+  for (int g = 0; g < G + 1; ++g) {
+    if (g * B >= n || g == G) { spare.push_back(g); continue; }
+    Group grp{g, g, {}};
+    for (int b = 0; b < B; ++b) grp.rows.r[b] = g * B + b < n ? g * B + b : -1;
+    gs.push_back(grp);
+    CUDA_CHECK(cudaMemsetAsync(kv(g), 0, 2 * kKv * sizeof(float), s));
+    CUDA_CHECK(cudaMemsetAsync(tok(g), 0, (size_t)B * 3 * sizeof(int64_t), s));  // <s> = 0
+  }
+  // Row a of group `from` -> empty slot b of group `to`: everything its next step reads.
+  auto move = [&](Group &from, int a, Group &to, int b) {
+    for (int l = 0; l < 2; ++l) {
+      const size_t sk = (size_t)(l * B + a), dk = (size_t)(l * B + b);
+      for (size_t off : {size_t{0}, kKv})
+        CUDA_CHECK(cudaMemcpyAsync(kv(to.kv) + off + dk * kKvRow, kv(from.kv) + off + sk * kKvRow,
+                                   kKvRow * sizeof(float), cudaMemcpyDeviceToDevice, s));
+      for (size_t off : {size_t{0}, kCkv})
+        CUDA_CHECK(cudaMemcpyAsync(ckv(to.slot) + off + dk * kCkvRow, ckv(from.slot) + off + sk * kCkvRow,
+                                   kCkvRow * sizeof(float), cudaMemcpyDeviceToDevice, s));
+    }
+    CUDA_CHECK(cudaMemcpyAsync(tok(to.slot) + b * 3, tok(from.slot) + a * 3, 3 * sizeof(int64_t),
+                               cudaMemcpyDeviceToDevice, s));
+    to.rows.r[b] = from.rows.r[a];
+    from.rows.r[a] = -1;
+  };
+
+  constexpr int R = kEosLag + 1;
+  int it = 0;
+  for (; it < MAXIT; ++it) {
+    if (it >= kEosLag) {  // step it - kEosLag has run: drop the rows that have ended by then
+      CUDA_CHECK(cudaEventSynchronize(step_done_[(it - kEosLag) % R]));
+      for (Group &g : gs)
+        for (int &r : g.rows.r)
+          if (r >= 0 && done[r]) r = -1;
+      int live = 0;
+      for (const Group &g : gs) live += g.live();
+      // Pack the live rows into as few step batches as hold them: empty the emptiest batch.
+      while ((int)gs.size() > (live + B - 1) / B) {
+        auto src = std::min_element(gs.begin(), gs.end(), [](const Group &a, const Group &b) { return a.live() < b.live(); });
+        for (int a = 0; a < B; ++a) {
+          if (src->rows.r[a] < 0) continue;
+          for (Group &dst : gs) {
+            if (&dst == &*src) continue;
+            const int b = (int)(std::find(dst.rows.r, dst.rows.r + B, -1) - dst.rows.r);
+            if (b < B) { move(*src, a, dst, b); break; }
+          }
+        }
+        spare.push_back(src->kv);
+        gs.erase(src);
+      }
+      if (gs.empty()) break;
+    }
+    for (Group &g : gs) {
+      const int out = spare.back();
+      spare.pop_back();
+      step_->set_tensor_address("tokens", tok(g.slot));
+      step_->set_tensor_address("pos", d_pos_.get() + it);
+      step_->set_tensor_address("ck", ckv(g.slot));
+      step_->set_tensor_address("cv", ckv(g.slot) + kCkv);
+      step_->set_tensor_address("kb", kv(g.kv));
+      step_->set_tensor_address("vb", kv(g.kv) + kKv);
+      step_->set_tensor_address("kb_out", kv(out));
+      step_->set_tensor_address("vb_out", kv(out) + kKv);
+      step_->set_tensor_address("logits", d_logits_.get());
+      if (!step_->execute(s)) throw std::runtime_error("formula step failed");
+      argmax_rows<<<B * 3, 256, 0, s>>>(d_logits_.get(), tok(g.slot), d_hist_.get(), g.rows, it, eos, h_eos_.get(), VOCAB);
+      spare.push_back(g.kv);  // free once this step has read it (stream order)
+      g.kv = out;
+      ++steps_run;
+    }
+    CUDA_CHECK(cudaEventRecord(step_done_[it % R], s));
+    if (!next.done()) encode_step(crops, order, next);  // the next cohort, a crop per step
+  }
+  CUDA_CHECK(cudaEventRecord(set_free_[set], s));
+  std::vector<int64_t> hist((size_t)n * MAXIT * 3);
+  CUDA_CHECK(cudaMemcpyAsync(hist.data(), d_hist_.get(), hist.size() * sizeof(int64_t), cudaMemcpyDeviceToHost, s));
   CUDA_CHECK(cudaStreamSynchronize(s));
-  out.assign(B, {});
-  for (int b = 0; b < B; ++b) {
+  for (int r = 0; r < n; ++r) {
     bool stop = false;
-    for (int st = 0; st < last && !stop; ++st)
+    for (int st = 0; st < it && !stop; ++st)
       for (int j = 0; j < 3; ++j) {
-        const int64_t t = hall[((size_t)st * B + b) * 3 + j];
+        const int64_t t = hist[((size_t)r * MAXIT + st) * 3 + j];
         if (t == eos) { stop = true; break; }
-        if (t != 0 && t != 1) out[b].push_back(t);
+        if (t != 0 && t != 1) toks[r].push_back(t);
       }
   }
 }
 
 std::vector<std::string> FormulaRecognizer::run(const std::vector<FormulaCrop> &crops, cudaStream_t s) {
-  std::vector<std::string> res(crops.size());
-  for (size_t c0 = 0; c0 < crops.size(); c0 += kMaxBatch) {
-    const int B = (int)std::min<size_t>(kMaxBatch, crops.size() - c0);
-    // Encoder one crop at a time: a batched conv drifts near-tie tokens.
-    if (!enc_->set_input_shape("x", dims({1, 1, kFormulaS, kFormulaS}))) throw std::runtime_error("formula enc shape");
-    enc_->set_tensor_address("x", d_x_.get());
-    for (int b = 0; b < B; ++b) {
-      const auto &c = crops[c0 + b];
-      formula_preprocess(c.bgr, c.step, c.w, c.h, h_x_.get());
-      if (!dump_dir.empty())
-        std::ofstream(dump_dir + "/x_" + std::to_string(dump_n + b) + ".f32", std::ios::binary)
-            .write(reinterpret_cast<const char *>(h_x_.get()), sizeof(float) * kFormulaS * kFormulaS);
-      CUDA_CHECK(cudaMemcpyAsync(d_x_.get(), h_x_.get(), sizeof(float) * kFormulaS * kFormulaS, cudaMemcpyHostToDevice, s));
-      enc_->set_tensor_address(enc_out_, d_mem_.get() + (size_t)b * CTX * MEMD);
-      if (!enc_->execute(s)) throw std::runtime_error("formula encoder failed");
-      CUDA_CHECK(cudaStreamSynchronize(s));  // h_x_ reused next crop
-    }
-    if (!prep_->set_input_shape("memory", dims({B, CTX, MEMD}))) throw std::runtime_error("formula prep shape");
-    prep_->set_tensor_address("memory", d_mem_.get());
-    prep_->set_tensor_address("ck", d_ck_.get());
-    prep_->set_tensor_address("cv", d_cv_.get());
-    if (!prep_->execute(s)) throw std::runtime_error("formula prep failed");
-    std::vector<std::vector<int64_t>> toks;
-    decode_chunk(B, toks, s);
-    for (int b = 0; b < B; ++b) {
-      res[c0 + b] = tok_->decode(toks[b], /*post_process=*/false);
+  const int n = (int)crops.size();
+  std::vector<std::string> res(n);
+  if (n == 0) return res;
+  std::vector<int> ink(n), order(n);
+  for (int i = 0; i < n; ++i) ink[i] = ink_pixels(crops[i]), order[i] = i;
+  std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return ink[a] > ink[b]; });
+  auto job = [&](int k) { return EncodeJob{k * kCohort, std::clamp(n - k * kCohort, 0, kCohort), k % 2, 0}; };
+  EncodeJob next = job(0);
+  while (!next.done()) encode_step(crops, order, next);
+  for (int k = 0; k * kCohort < n; ++k) {
+    const int c0 = k * kCohort, m = std::min(kCohort, n - c0);
+    next = job(k + 1);
+    std::vector<std::vector<int64_t>> toks(m);
+    decode_cohort(m, k % 2, toks, s, crops, order, next);
+    while (!next.done()) encode_step(crops, order, next);
+    for (int r = 0; r < m; ++r) {
+      const int i = order[c0 + r];
+      res[i] = tok_->decode(toks[r], /*post_process=*/false);
       if (!dump_dir.empty()) {
-        std::ofstream t(dump_dir + "/tok_" + std::to_string(dump_n + b) + ".txt");
-        for (auto id : toks[b]) t << id << ' ';
+        std::ofstream t(dump_dir + "/tok_" + std::to_string(dump_n + i) + ".txt");
+        for (auto id : toks[r]) t << id << ' ';
       }
     }
-    dump_n += B;
   }
+  dump_n += n;
   return res;
 }
 

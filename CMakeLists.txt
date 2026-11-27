@@ -197,6 +197,11 @@ add_executable(formula_golden_test tests/formula_golden_test.cpp)
 target_link_libraries(formula_golden_test PRIVATE hp_core)
 set_target_properties(formula_golden_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
 
+add_executable(formula_bench tests/formula_bench.cpp)
+target_link_libraries(formula_bench PRIVATE hp_core)
+target_compile_options(formula_bench PRIVATE -O3)
+set_target_properties(formula_bench PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
+
 add_executable(render_pool_test tests/render_pool_test.cpp)
 target_link_libraries(render_pool_test PRIVATE hp_core)
 set_target_properties(render_pool_test PROPERTIES BUILD_RPATH "${TRT_LIB_DIR};${PDFIUM_DIR}/lib")
