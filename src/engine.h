@@ -21,8 +21,8 @@
 //     the CUDA context, which this process may share with other CUDA users.
 //   * Idle unload: a watchdog thread unloads once no load(), warmup() or parse()
 //     has been running for `idle_unload`. It never interrupts an operation:
-//     operations hold the engine lock, and the watchdog re-checks for activity
-//     after taking it.
+//     the watchdog only unloads when no operation is running or waiting, and
+//     takes the engine exclusively to do it.
 //
 // Measured (RTX 4050 laptop 6 GB, models on an external drive, 960 layout, rec
 // budget, FP16 formula step; tests/engine_lifecycle_test.cpp):
@@ -43,9 +43,15 @@
 //   Pinning (95 ms of each reload) is redone on every load so that unload also
 //   returns the 615 MiB of locked host memory.
 //
-// Threading: all methods are thread-safe. Operations are serialized (one GPU
-// pipeline), so concurrent parse() calls run one after another. The PageSink
-// runs on an internal thread.
+// Threading: all methods are thread-safe. Up to EngineConfig::concurrent_documents
+// parse() calls run at once and share one GPU pipeline (page_pipeline.h): pages
+// of several documents are in flight together, so one document's rendering
+// overlaps another's GPU work and assembly. load(), warmup() and unload() run
+// alone. Every operation waits its turn in arrival order (FIFO): an operation
+// that cannot start yet (a lifecycle operation while parses run, a parse past the
+// document limit or behind a lifecycle operation) holds up the ones behind it.
+// The PageSink runs on the pipeline's assembly thread, which every document in
+// flight shares: a slow sink delays the other documents too.
 //
 // Process model: the constructor forks the page-worker supervisor
 // (render_pool.h). Construct the Engine early in the process lifetime, before
@@ -65,11 +71,15 @@
 namespace hp {
 
 class RenderPool;
+class PagePipeline;
 
 struct EngineConfig {
   ModelConfig models;
   // Page worker processes. 0 = hardware threads - 2, clamped to [1, 8].
   int workers = 0;
+  // Documents parsed at once (concurrent parse() calls); more wait their turn.
+  // 1 = one document at a time, end to end.
+  int concurrent_documents = 8;
   // A page whose text layer + render runs longer than this is killed and reported
   // as failed (120 s).
   std::chrono::milliseconds page_timeout{120000};
@@ -102,8 +112,8 @@ class Engine {
   void load();
   // load() if needed, then run the warm-up page through every GPU path.
   void warmup();
-  // Release the models and pinned memory; no-op when unloaded. Waits for a
-  // running parse to finish.
+  // Release the models and pinned memory; no-op when unloaded. Waits for the
+  // running parses to finish.
   void unload();
   [[nodiscard]] bool loaded() const;
 
@@ -123,20 +133,25 @@ class Engine {
 
  private:
   class Activity;
+  class Exclusive;
+  bool enter(bool exclusive);
+  void leave(bool exclusive);
   void load_locked();
   void unload_locked(bool idle);
   void watchdog();
 
   EngineConfig cfg_;
   std::unique_ptr<RenderPool> pool_;  // first: forked before any CUDA use, destroyed last
-  std::unique_ptr<ModelSet> models_;  // null while unloaded; guarded by op_mu_
+  std::unique_ptr<ModelSet> models_;  // null while unloaded; changed only by an exclusive operation
+  std::unique_ptr<PagePipeline> pipeline_;  // with the models
 
-  std::mutex op_mu_;  // serializes load / warmup / unload / parse
-
-  // Watchdog state, guarded by state_mu_.
+  // Admission (enter/leave) and watchdog state, guarded by state_mu_.
   mutable std::mutex state_mu_;
   std::condition_variable state_cv_;
-  int active_ = 0;  // operations running or waiting for op_mu_
+  uint64_t next_ticket_ = 0, serving_ = 0;  // FIFO turns
+  int parsing_ = 0;                          // parses running
+  bool exclusive_ = false;                   // load / warmup / unload (or a parse loading) running
+  int active_ = 0;  // operations running or waiting for their turn
   bool loaded_ = false, stop_ = false;
   std::chrono::steady_clock::time_point last_use_;
   std::chrono::milliseconds idle_unload_{0};

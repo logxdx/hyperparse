@@ -31,6 +31,7 @@ namespace hp {
 struct RenderPool::Job {
   int32_t page, slot;
   uint32_t gen;
+  int32_t doc_slot;
   int32_t ocr_dpi, force, tables, tables_dpi;
   uint64_t doc_len;
 };
@@ -56,6 +57,14 @@ using Clock = std::chrono::steady_clock;
 // replaced by a fresh fork (frees pdfium's caches and the document copy).
 constexpr int kIdleRecycleMs = 2000;
 constexpr int kExitRecycle = 3;  // worker exit code: "replace me", not a crash
+
+// Documents a worker keeps open. Pages of the documents in flight interleave
+// (the page pipeline hands out pixel slots round-robin across documents), so a
+// worker must not reopen a document whenever its next page belongs to another
+// one: a large PDF costs a copy plus pdfium's xref parse per open. The byte cap
+// bounds the private copies; the document being worked on is always kept.
+constexpr size_t kMaxOpenDocs = 8;
+constexpr size_t kMaxOpenBytes = size_t{256} << 20;
 
 int64_t now_ns() { return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count(); }
 
@@ -126,9 +135,13 @@ RenderPool::RenderPool(const Options &opt) : opt_(opt) {
   base_ = static_cast<uint8_t *>(map_shared(map_bytes_));
   state_ = new (map_shared(sizeof(WorkerState) * opt_.workers)) WorkerState[opt_.workers];
 
-  doc_fd_ = memfd_create("hp-document", MFD_CLOEXEC);
+  if (opt_.documents < 1) throw std::invalid_argument("RenderPool: bad options");
+  for (int i = 0; i < opt_.documents; ++i) {
+    doc_fd_.push_back(memfd_create("hp-document", MFD_CLOEXEC));
+    if (doc_fd_.back() < 0) throw std::runtime_error("RenderPool: memfd failed");
+  }
   int job[2], done[2];
-  if (doc_fd_ < 0 || pipe2(job, O_CLOEXEC) || pipe2(done, O_CLOEXEC)) throw std::runtime_error("RenderPool: memfd/pipe failed");
+  if (pipe2(job, O_CLOEXEC) || pipe2(done, O_CLOEXEC)) throw std::runtime_error("RenderPool: pipe failed");
   job_r_ = job[0], job_w_ = job[1], done_r_ = done[0], done_w_ = done[1];
 
   const pid_t parent = getpid();
@@ -162,7 +175,7 @@ RenderPool::~RenderPool() {
     }
   }
   if (done_r_ >= 0) ::close(done_r_);
-  if (doc_fd_ >= 0) ::close(doc_fd_);
+  for (const int fd : doc_fd_) ::close(fd);
   if (pinned_) cudaHostUnregister(base_);
   if (base_) munmap(base_, map_bytes_);
   if (state_) munmap(state_, sizeof(WorkerState) * opt_.workers);
@@ -170,25 +183,27 @@ RenderPool::~RenderPool() {
 
 // ── parent side ─────────────────────────────────────────────────────────────
 
-void RenderPool::release_document() {
-  if (ftruncate(doc_fd_, 0) == 0) doc_len_ = 0;
+void RenderPool::release_document(int doc_slot) {
+  if (doc_slot < 0 || doc_slot >= opt_.documents) throw std::invalid_argument("RenderPool: bad document slot");
+  (void)ftruncate(doc_fd_[doc_slot], 0);
 }
 
-uint32_t RenderPool::set_document(std::span<const uint8_t> pdf) {
-  if (ftruncate(doc_fd_, static_cast<off_t>(pdf.size())) != 0) throw std::runtime_error("RenderPool: ftruncate failed");
+RenderPool::DocRef RenderPool::set_document(int doc_slot, std::span<const uint8_t> pdf) {
+  if (doc_slot < 0 || doc_slot >= opt_.documents) throw std::invalid_argument("RenderPool: bad document slot");
+  const int fd = doc_fd_[doc_slot];
+  if (ftruncate(fd, static_cast<off_t>(pdf.size())) != 0) throw std::runtime_error("RenderPool: ftruncate failed");
   size_t off = 0;
   while (off < pdf.size()) {
-    const ssize_t w = pwrite(doc_fd_, pdf.data() + off, pdf.size() - off, static_cast<off_t>(off));
+    const ssize_t w = pwrite(fd, pdf.data() + off, pdf.size() - off, static_cast<off_t>(off));
     if (w < 0 && errno == EINTR) continue;
     if (w <= 0) throw std::runtime_error("RenderPool: document write failed");
     off += static_cast<size_t>(w);
   }
-  doc_len_ = pdf.size();
-  return ++gen_;
+  return {gen_.fetch_add(1) + 1, doc_slot, pdf.size()};
 }
 
-void RenderPool::submit(int page, int slot, uint32_t gen, const PageJobOptions &o) {
-  const Job j{page, slot, gen, o.ocr_dpi, o.force, o.tables ? 1 : 0, o.tables_dpi, doc_len_};
+void RenderPool::submit(int page, int slot, const DocRef &doc, const PageJobOptions &o) {
+  const Job j{page, slot, doc.gen, doc.slot, o.ocr_dpi, o.force, o.tables ? 1 : 0, o.tables_dpi, doc.len};
   SigpipeBlocker no_sigpipe;
   if (!write_full(job_w_, &j, sizeof j)) throw std::runtime_error("RenderPool: job pipe closed (supervisor died)");
 }
@@ -207,6 +222,10 @@ RenderPool::Done RenderPool::wait_done() {
     if (pr == 0) throw std::runtime_error("RenderPool: no page finished within the page timeout (pool stalled)");
     if (errno != EINTR) throw std::runtime_error("RenderPool: poll failed");
   }
+  return read_done();
+}
+
+RenderPool::Done RenderPool::read_done() {
   Done d{};
   if (!read_full(done_r_, &d, sizeof d)) throw std::runtime_error("RenderPool: result pipe closed (supervisor died)");
   return d;
@@ -312,9 +331,15 @@ void RenderPool::worker_main(int index) {
   signal(SIGINT, SIG_IGN);
   std::setlocale(LC_CTYPE, "C.UTF-8");  // iswalpha & co. for the legibility checks
   WorkerState &self = state_[index];
-  std::vector<uint8_t> doc, meta;  // private copy of the document: see header
-  std::unique_ptr<PdfRaster> raster;
-  uint32_t doc_gen = 0;
+  // Private copies of the documents seen last (see header), most recently used
+  // last. `raster` is declared after `bytes` so it closes before they are freed.
+  struct OpenDoc {
+    uint32_t gen = 0;
+    std::vector<uint8_t> bytes;
+    std::unique_ptr<PdfRaster> raster;
+  };
+  std::vector<OpenDoc> open;
+  std::vector<uint8_t> meta;
   Job j{};
   for (;;) {
     // Wait for a job. The job pipe is shared and non-blocking (set by the
@@ -330,7 +355,7 @@ void RenderPool::worker_main(int index) {
     // forks) within 1 s of the parse. A recycled worker that gets a job
     // mid-document reloads from the memfd, which stays valid until the parse ends.
     pollfd pfd{job_r_, POLLIN, 0};
-    const int pr = ::poll(&pfd, 1, doc_gen != 0 ? kIdleRecycleMs : -1);
+    const int pr = ::poll(&pfd, 1, !open.empty() ? kIdleRecycleMs : -1);
     if (pr == 0) _exit(kExitRecycle);
     if (pr < 0) {
       if (errno == EINTR) continue;
@@ -348,19 +373,30 @@ void RenderPool::worker_main(int index) {
     self.gen = j.gen;
     self.started_ns.store(now_ns(), std::memory_order_release);
 
-    if (j.gen != doc_gen) {
-      raster.reset();
-      doc.resize(j.doc_len);
+    auto it = std::find_if(open.begin(), open.end(), [&](const OpenDoc &o) { return o.gen == j.gen; });
+    if (it != open.end()) {
+      std::rotate(it, it + 1, open.end());  // most recently used last
+    } else {
+      size_t bytes = j.doc_len;
+      for (const OpenDoc &o : open) bytes += o.bytes.size();
+      while (!open.empty() && (open.size() >= kMaxOpenDocs || bytes > kMaxOpenBytes)) {
+        bytes -= open.front().bytes.size();
+        open.erase(open.begin());
+      }
+      OpenDoc &o = open.emplace_back();
+      o.gen = j.gen;
+      o.bytes.resize(j.doc_len);
+      const int fd = j.doc_slot >= 0 && j.doc_slot < opt_.documents ? doc_fd_[j.doc_slot] : -1;
       size_t off = 0;
-      while (off < doc.size()) {
-        const ssize_t r = pread(doc_fd_, doc.data() + off, doc.size() - off, static_cast<off_t>(off));
+      while (fd >= 0 && off < o.bytes.size()) {
+        const ssize_t r = pread(fd, o.bytes.data() + off, o.bytes.size() - off, static_cast<off_t>(off));
         if (r < 0 && errno == EINTR) continue;
         if (r <= 0) break;
         off += static_cast<size_t>(r);
       }
-      if (off == doc.size()) raster = std::make_unique<PdfRaster>(doc.data(), doc.size());
-      doc_gen = j.gen;
+      if (fd >= 0 && off == o.bytes.size()) o.raster = std::make_unique<PdfRaster>(o.bytes.data(), o.bytes.size());
     }
+    const PdfRaster *raster = open.back().raster.get();
 
     Done d{j.page, j.slot, 0, 0, kRenderFailed, kNative, j.gen, 0, 0.f, 0.f, 0.f};
     if (raster && raster->ok()) {

@@ -1,4 +1,5 @@
-// hp::Engine lifecycle: warm-up, explicit unload, idle unload, reload on demand.
+// hp::Engine lifecycle: warm-up, explicit unload, idle unload, reload on demand,
+// concurrent parses.
 //
 //   engine_lifecycle_test lifecycle <doc.pdf>
 //       Asserts the state machine and prints device memory at each step.
@@ -224,6 +225,49 @@ int lifecycle(const std::vector<uint8_t> &pdf) {
   e.load();
   std::this_thread::sleep_for(milliseconds(400));
   CHECK(e.loaded());
+
+  // 8. Concurrent parses share the pipeline: each gets its own pages, as parsed
+  //    alone; a failing one (throwing sink, unreadable PDF) fails alone; an
+  //    unload() issued meanwhile waits for the running parses.
+  {
+    constexpr int kGood = 4;
+    std::vector<Run> runs(kGood);
+    bool bad_sink = false, bad_pdf = false;
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kGood; ++i) threads.emplace_back([&, i] { runs[i] = parse(e, pdf); });
+    threads.emplace_back([&] {
+      int n = 0;
+      try {
+        (void)e.parse(pdf, {}, [&](hp::PageResult &&) {
+          if (++n == 2) throw std::runtime_error("concurrent sink failure");
+        });
+      } catch (const std::runtime_error &x) {
+        bad_sink = std::string(x.what()) == "concurrent sink failure";
+      }
+    });
+    threads.emplace_back([&] {
+      try {
+        const std::vector<uint8_t> junk(1000, 'x');
+        (void)e.parse(junk, {}, [](hp::PageResult &&) {});
+      } catch (const hp::InvalidPdfError &) {
+        bad_pdf = true;
+      }
+    });
+    std::this_thread::sleep_for(milliseconds(50));
+    const int unloads0 = e.lifecycle().unloads;
+    e.unload();  // waits its turn behind the parses above (a parse behind it reloads)
+    CHECK(e.lifecycle().unloads == unloads0 + 1);
+    for (auto &t : threads) t.join();
+    CHECK(bad_sink && bad_pdf);
+    for (const Run &r : runs) {
+      int same_pages = 0;
+      for (size_t i = 0; i < r.layout.size() && i < cold.layout.size(); ++i) same_pages += same_layout(r.layout[i], cold.layout[i]);
+      const double cf1 = word_f1(cold, r);
+      std::printf("concurrent parse: %d/%d pages ok, layout identical on %d, word F1 %.4f\n", r.ok, r.stats.pages,
+                  same_pages, cf1);
+      CHECK(r.ok == cold.stats.pages && same_pages == static_cast<int>(cold.layout.size()) && cf1 >= 0.995);
+    }
+  }
 
   const auto l = e.lifecycle();
   std::printf("lifecycle: %d loads, %d unloads (%d idle)\n", l.loads, l.unloads, l.idle_unloads);

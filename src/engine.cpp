@@ -47,10 +47,24 @@ class Engine::Activity {
   Engine &e_;
 };
 
+// An exclusive turn (load / warmup / unload) for the scope.
+class Engine::Exclusive {
+ public:
+  explicit Exclusive(Engine &e) : e_(e) { e_.enter(true); }
+  ~Exclusive() { e_.leave(true); }
+  Exclusive(const Exclusive &) = delete;
+  Exclusive &operator=(const Exclusive &) = delete;
+
+ private:
+  Engine &e_;
+};
+
 Engine::Engine(const EngineConfig &cfg) : cfg_(cfg), last_use_(Clock::now()), idle_unload_(cfg.idle_unload) {
   if (cfg_.workers <= 0) cfg_.workers = default_workers();
+  cfg_.concurrent_documents = std::max(1, cfg_.concurrent_documents);
   RenderPool::Options po;
   po.workers = cfg_.workers;
+  po.documents = cfg_.concurrent_documents;
   po.slots = 2 * cfg_.workers + 2;
   po.pixel_bytes = kSlotPixelBytes;
   po.meta_bytes = kSlotMetaBytes;
@@ -61,15 +75,49 @@ Engine::Engine(const EngineConfig &cfg) : cfg_(cfg), last_use_(Clock::now()), id
 }
 
 Engine::~Engine() {
-  {
-    std::lock_guard l(state_mu_);
-    stop_ = true;
-  }
+  std::unique_lock l(state_mu_);
+  stop_ = true;
+  l.unlock();
   state_cv_.notify_all();
   watchdog_.join();
-  std::lock_guard op(op_mu_);
-  models_.reset();  // before the pool: the slot ring is unregistered after the GPU is idle
+  l.lock();
+  state_cv_.wait(l, [&] { return parsing_ == 0 && !exclusive_; });
+  l.unlock();
+  pipeline_.reset();  // joins its threads; the GPU is idle
+  models_.reset();    // before the pool: the slot ring is unregistered after the GPU is idle
   pool_.reset();
+}
+
+// ── admission ───────────────────────────────────────────────────────────────
+
+// Waits for the caller's turn (FIFO by ticket) and enters. Exclusive: once every
+// parse has left. Shared (a parse): beside up to concurrent_documents - 1 others;
+// with the models unloaded it enters exclusively instead, to load them, and the
+// return value says so.
+bool Engine::enter(bool exclusive) {
+  std::unique_lock l(state_mu_);
+  const uint64_t me = next_ticket_++;
+  state_cv_.wait(l, [&] {
+    if (serving_ != me || exclusive_) return false;
+    if (exclusive || !loaded_) return parsing_ == 0;
+    return parsing_ < cfg_.concurrent_documents;
+  });
+  ++serving_;
+  const bool excl = exclusive || !loaded_;
+  if (excl) exclusive_ = true;
+  else ++parsing_;
+  l.unlock();
+  state_cv_.notify_all();  // the next ticket may enter too
+  return excl;
+}
+
+void Engine::leave(bool exclusive) {
+  {
+    std::lock_guard l(state_mu_);
+    if (exclusive) exclusive_ = false;
+    else --parsing_;
+  }
+  state_cv_.notify_all();
 }
 
 // ── lifecycle ───────────────────────────────────────────────────────────────
@@ -81,7 +129,15 @@ void Engine::load_locked() {
   const auto t_pin = Clock::now();
   pool_->pin();
   const double pin_ms = ms_since(t_pin);
+  std::unique_ptr<PagePipeline> pipeline;
+  try {
+    pipeline = std::make_unique<PagePipeline>(*models, *pool_);
+  } catch (...) {
+    pool_->unpin_and_release();
+    throw;
+  }
   models_ = std::move(models);
+  pipeline_ = std::move(pipeline);
   std::lock_guard l(state_mu_);
   loaded_ = true;
   ++life_.loads;
@@ -93,6 +149,7 @@ void Engine::load_locked() {
 void Engine::unload_locked(bool idle) {
   if (!models_) return;
   const auto t = Clock::now();
+  pipeline_.reset();
   models_.reset();
   const double models_ms = ms_since(t);
   const auto t_unpin = Clock::now();
@@ -108,13 +165,13 @@ void Engine::unload_locked(bool idle) {
 
 void Engine::load() {
   Activity a(*this);
-  std::lock_guard op(op_mu_);
+  Exclusive x(*this);
   load_locked();
 }
 
 void Engine::warmup() {
   Activity a(*this);
-  std::lock_guard op(op_mu_);
+  Exclusive x(*this);
   load_locked();
   const auto t = Clock::now();
   models_->warmup();
@@ -124,7 +181,7 @@ void Engine::warmup() {
 
 void Engine::unload() {
   Activity a(*this);
-  std::lock_guard op(op_mu_);
+  Exclusive x(*this);
   unload_locked(false);
 }
 
@@ -152,8 +209,9 @@ LifecycleStats Engine::lifecycle() const {
 }
 
 // Sleeps until the idle deadline (or a state change), then unloads if the
-// engine is still loaded and idle. A parse that starts while the watchdog is
-// waiting for op_mu_ is seen through active_ and cancels the unload.
+// engine is still loaded and idle. An operation that arrives meanwhile is seen
+// through active_ (counted before it takes a turn) and cancels the unload; one
+// that arrives during the unload waits for its turn behind it.
 void Engine::watchdog() {
   std::unique_lock l(state_mu_);
   while (!stop_) {
@@ -166,18 +224,16 @@ void Engine::watchdog() {
       state_cv_.wait_until(l, deadline);
       continue;  // re-evaluate: activity, timeout change or stop may have happened
     }
-    l.unlock();
-    {
-      std::lock_guard op(op_mu_);
-      bool still_idle;
-      {
-        std::lock_guard s(state_mu_);
-        still_idle = !stop_ && active_ == 0 && idle_unload_.count() > 0 &&
-                     Clock::now() >= last_use_ + idle_unload_;
-      }
-      if (still_idle) unload_locked(true);
+    if (exclusive_ || parsing_ > 0 || serving_ != next_ticket_) {  // not expected with active_ == 0
+      state_cv_.wait(l);
+      continue;
     }
+    exclusive_ = true;
+    l.unlock();
+    unload_locked(true);
     l.lock();
+    exclusive_ = false;
+    state_cv_.notify_all();
   }
 }
 
@@ -188,12 +244,28 @@ ParseStats Engine::parse(std::span<const uint8_t> pdf, const ParseOptions &opt, 
     throw std::invalid_argument("OcrMode::kAll needs an engine with ModelConfig::ocr = true");
   if (opt.ocr_dpi < 36 || opt.ocr_dpi > 600) throw std::invalid_argument("ocr_dpi must be in [36, 600]");
   Activity a(*this);
-  std::lock_guard op(op_mu_);
   const auto t = Clock::now();
-  const bool cold = !models_;
-  load_locked();
-  const double load_ms = cold ? ms_since(t) : 0.0;
-  ParseStats stats = parse_document(*models_, *pool_, pdf, opt, sink);
+  double load_ms = 0;
+  if (enter(false)) {  // unloaded: load alone first, then parse beside the others
+    try {
+      load_locked();
+    } catch (...) {
+      leave(true);
+      throw;
+    }
+    load_ms = ms_since(t);
+    {
+      std::lock_guard l(state_mu_);
+      exclusive_ = false;
+      ++parsing_;
+    }
+    state_cv_.notify_all();
+  }
+  struct Leave {
+    Engine &e;
+    ~Leave() { e.leave(false); }
+  } leave_guard{*this};
+  ParseStats stats = pipeline_->parse(pdf, opt, sink);
   stats.load_ms = load_ms;
   stats.wall_ms += load_ms;
   return stats;

@@ -1,6 +1,7 @@
 // RenderPool fault tolerance: every submitted page must yield exactly one result
 // even when workers are killed (crash) or overrun the page timeout, and the pool
-// must keep working afterwards.
+// must keep working afterwards; pages of two documents in flight at once each
+// render from their own document.
 //
 //   render_pool_test <doc.pdf>
 
@@ -18,6 +19,11 @@
 #include <dirent.h>
 #include <unistd.h>
 
+#include <fpdf_edit.h>
+#include <fpdf_ppo.h>
+#include <fpdf_save.h>
+#include <fpdfview.h>
+
 #include "pdf_render.h"
 #include "render_pool.h"
 
@@ -31,6 +37,27 @@ int failures = 0;
       ++failures;                                                        \
     }                                                                    \
   } while (0)
+
+// A new PDF made of the first `n` pages of `pdf` in reverse order (empty on failure).
+std::vector<uint8_t> reversed_copy(const std::vector<uint8_t> &pdf, int n) {
+  struct Writer : FPDF_FILEWRITE {
+    std::vector<uint8_t> out;
+  } w;
+  w.version = 1;
+  w.WriteBlock = [](FPDF_FILEWRITE *self, const void *data, unsigned long size) -> int {
+    auto *p = static_cast<const uint8_t *>(data);
+    static_cast<Writer *>(self)->out.insert(static_cast<Writer *>(self)->out.end(), p, p + size);
+    return 1;
+  };
+  hp::PdfRaster src(pdf.data(), pdf.size());  // initializes pdfium
+  FPDF_DOCUMENT dst = FPDF_CreateNewDocument();
+  std::string range;
+  for (int i = n; i >= 1; --i) range += std::to_string(i) + (i > 1 ? "," : "");
+  const bool ok = dst && src.ok() && FPDF_ImportPages(dst, static_cast<FPDF_DOCUMENT>(src.doc()), range.c_str(), 0) &&
+                  FPDF_SaveAsCopy(dst, &w, 0);
+  if (dst) FPDF_CloseDocument(dst);
+  return ok ? w.out : std::vector<uint8_t>{};
+}
 
 // Grandchildren of this process = the pool's workers (children of the supervisor).
 std::vector<pid_t> worker_pids() {
@@ -54,14 +81,15 @@ struct Counts {
 // Submit every page through the slot ring; optionally kill a busy worker after
 // `kill_after` results.
 Counts run_document(hp::RenderPool &pool, const std::vector<uint8_t> &pdf, int n_pages, int kill_after) {
-  const uint32_t gen = pool.set_document(pdf);
+  const auto doc = pool.set_document(0, pdf);
+  const uint32_t gen = doc.gen;
   std::vector<int> free_slots;
   for (int s = 0; s < pool.slots(); ++s) free_slots.push_back(s);
   int next = 0, received = 0;
   Counts c;
   auto fill = [&] {
     while (next < n_pages && !free_slots.empty()) {
-      pool.submit(next++, free_slots.back(), gen, {});
+      pool.submit(next++, free_slots.back(), doc, {});
       free_slots.pop_back();
     }
   };
@@ -147,6 +175,55 @@ int main(int argc, char **argv) {
     std::printf("timeout run: %d ok, %d timed out, %d crashed\n", c.ok, c.timed_out, c.crashed);
     CHECK(static_cast<int>(c.pages.size()) == std::min(n_pages, 30));
     CHECK(c.timed_out >= 1);
+  }
+
+  // 5. Two documents in flight at once (two document slots), pages interleaved:
+  //    every page renders from its own document. The second document is the
+  //    first n pages of the first in reverse (page i of B = page n-1-i of A), so
+  //    a worker that rendered from the wrong document would produce other pixels.
+  o.page_timeout = std::chrono::milliseconds(120000);
+  o.documents = 2;
+  {
+    const int n = std::min(n_pages, 12);
+    const std::vector<uint8_t> reversed = reversed_copy(pdf, n);
+    CHECK(!reversed.empty());
+    hp::RenderPool pool(o);
+    const auto a = pool.set_document(0, pdf);
+    const auto b = pool.set_document(1, reversed);
+    CHECK(a.gen != b.gen);
+    // Checksum per (document, page) of the rendered pixels.
+    std::vector<uint64_t> sum_a(n), sum_b(n);
+    std::vector<int> free_slots;
+    for (int s = 0; s < pool.slots(); ++s) free_slots.push_back(s);
+    int next = 0, received = 0, ok = 0;
+    auto fill = [&] {
+      while (next < 2 * n && !free_slots.empty()) {
+        const bool is_a = next % 2 == 0;
+        pool.submit(next / 2, free_slots.back(), is_a ? a : b, {});
+        free_slots.pop_back();
+        ++next;
+      }
+    };
+    fill();
+    while (received < 2 * n) {
+      const auto d = pool.wait_done();
+      ++received;
+      if (d.status == hp::RenderPool::kOk) {
+        ++ok;
+        uint64_t h = 1469598103934665603ull;
+        const uint8_t *px = pool.pixels(d.slot);
+        for (size_t i = 0; i < static_cast<size_t>(d.w) * d.h * 3; i += 61) h = (h ^ px[i]) * 1099511628211ull;
+        if (d.gen == a.gen) sum_a[d.page] = h;
+        else sum_b[n - 1 - d.page] = h;  // B's page i is A's page n-1-i
+      }
+      free_slots.push_back(d.slot);
+      fill();
+    }
+    std::printf("two documents: %d ok of %d\n", ok, 2 * n);
+    CHECK(ok == 2 * n);
+    CHECK(sum_a == sum_b);
+    pool.release_document(0);
+    pool.release_document(1);
   }
 
   std::printf(failures ? "FAILED (%d)\n" : "PASS\n", failures);

@@ -1,22 +1,46 @@
 #pragma once
-// One document through the loaded engine:
+// Documents through the loaded engine. One long-lived pipeline serves every
+// document in flight, so the GPU does not idle between documents:
 //
+//   caller thread (per document)  open the PDF for its page count, publish it in a
+//        │                        free document slot of the pool, wait for its pages
 //   page workers (RenderPool)     text layer -> route -> render into a pinned slot
 //        │  Done (pipe)
-//   GPU thread (caller)           per page, alternating two LayoutLanes:
+//   GPU thread                    per page of any document, alternating two LayoutLanes:
 //        │                          H2D upload -> multi_resize -> D-FINE (lane stream)
 //        │                          OCR stage on the OCR stream (ocr_stage.h)
 //        │                          lane sync -> copy formula crops -> slot freed
 //        │  PageWork (queue)
-//   assembly thread               formula decode, batched across queued pages
-//                                 -> reading order + Markdown -> PageSink
+//   assembly thread               formula decode, batched across queued pages (of
+//                                 any document) -> reading order + Markdown -> sink
 //
 // Back-pressure is the slot ring: a page is only submitted to the workers when a
 // slot is free, and a slot is freed as soon as the GPU no longer reads it.
+//
+// Sharing between documents: free slots, and the GPU among rendered pages, go
+// first to the document with the fewest pages left (ties: the earliest), so a
+// short document overtakes a long one instead of queueing behind all its pages;
+// every third slot and every third GPU page go to the earliest instead, so a
+// long document keeps at least a third under a stream of short ones.
+//
+// Why one pipeline for all documents: run one document at a time end to end and
+// every document pays render latency (text layer + raster, ~21 ms for a page)
+// with the GPU idle, then GPU time with the workers idle, then assembly with
+// both idle. Measured on 300 one-page documents (RTX 4050 laptop, 8 workers,
+// 8 requests in flight): 49 ms per document serialized (first page rendered at
+// 21 ms, GPU done at 44 ms), so 20 pages/s, against 44.5 pages/s for the same
+// pages as one PDF. The probe, the memfd hand-off and the thread start cost
+// 0.1-0.2 ms together. Overlapped: 43-44 pages/s, the one-PDF rate.
+// The same documents with a 302-page and a 100-page PDF among them: short
+// requests p50/p90/p99 156/332/637 ms (one document at a time: 350/960/7114 ms,
+// stuck behind the long ones); the whole mix 20.0 s instead of 28.5 s.
+//
 // Choices, with evidence:
 //  * Two lanes: D-FINE for page i+1 overlaps OCR for page i. GPU utilization was
 //    100% on the IDL scan run, but 1 lane vs 2 has not been A/B tested in
-//    isolation.
+//    isolation. A lane whose page has no successor ready is finished at once
+//    (before the GPU thread blocks), so a document's last page never waits for
+//    another document's first.
 //  * Formulas on their own thread and stream: decoding is autoregressive (25.2 ms
 //    per formula with the FP16 step) and would stall the lanes. Measured on 60
 //    paper pages with 98 formulas: 25.1 pages/s without formulas, 11.8 with.
@@ -25,12 +49,18 @@
 //  * Slots: 2 × workers + 2, so every worker can render ahead while both lanes
 //    hold a page.
 //
-// Errors: if any stage throws, submission stops, every outstanding page job
-// is drained (the pool guarantees one result per job), the GPU streams are
-// synchronized and the assembly thread is joined. Only then is the exception
-// rethrown, so the pool and models stay reusable for the next document.
+// Errors are per document. A page that fails to render arrives as
+// PageResult::ok == false. Anything else that goes wrong with one of a
+// document's pages (corrupt metadata, a GPU stage throwing, its sink throwing)
+// fails that document only: it stops getting slots, its jobs already submitted
+// are drained (the pool guarantees one result per job), its undelivered pages
+// are dropped, and parse() rethrows the first error once nothing of the
+// document is left in the pipeline. Other documents carry on. A broken pool
+// (dead or stalled) fails every document in flight; the next document then
+// fails fast if the pool is still dead.
 
 #include <cstdint>
+#include <memory>
 #include <span>
 
 #include "model_set.h"
@@ -39,9 +69,23 @@
 
 namespace hp {
 
-// `pool` must be idle (no outstanding jobs) and `models` loaded. Blocks until every
-// page has been delivered to `sink`.
-ParseStats parse_document(ModelSet &models, RenderPool &pool, std::span<const uint8_t> pdf, const ParseOptions &opt,
-                          const PageSink &sink);
+class PagePipeline {
+ public:
+  // Starts the GPU and assembly threads. `models` and `pool` must outlive it.
+  PagePipeline(ModelSet &models, RenderPool &pool);
+  // No parse() may be running.
+  ~PagePipeline();
+  PagePipeline(const PagePipeline &) = delete;
+  PagePipeline &operator=(const PagePipeline &) = delete;
+
+  // Parse one document; blocks until every page has been delivered to `sink`
+  // (or the document failed). Thread-safe: up to pool.documents() calls run at
+  // once and share the GPU; more wait for a document slot.
+  ParseStats parse(std::span<const uint8_t> pdf, const ParseOptions &opt, const PageSink &sink);
+
+ private:
+  class Impl;
+  std::unique_ptr<Impl> impl_;
+};
 
 }  // namespace hp

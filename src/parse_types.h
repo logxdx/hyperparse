@@ -84,8 +84,9 @@ struct PageResult {
 };
 
 // Called once per page as pages complete: in completion order (not page order),
-// never concurrently, from the engine's assembly thread. An exception thrown by
-// the sink aborts the parse and is rethrown from Engine::parse.
+// never concurrently, from the engine's assembly thread. That thread serves every
+// document in flight, so a slow sink delays the others too. An exception thrown
+// by the sink aborts this parse only and is rethrown from Engine::parse.
 using PageSink = std::function<void(PageResult &&)>;
 
 struct ParseStats {
