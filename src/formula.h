@@ -5,10 +5,12 @@
 // on TRT enqueueV3. Preprocess is OpenCV-free (ink trim -> PIL-exact bicubic ->
 // gray -> centre pad).
 //
-// Batching. The step graph always runs at batch kBatch: its TensorRT kernels differ by batch
-// size (FP16 near-ties then flip a token now and then), while a row's tokens never depend on
-// the other rows of the batch. So any crop decodes the same whatever it shares a batch with,
-// and rows can be moved between batches as long as they are at the same position:
+// Batching. The step graph runs at batch kBatch: its TensorRT kernels differ by batch size
+// (FP16 near-ties then flip a token now and then: 8 of 321 arxiv100 formulas differ between
+// batch 1 and 8), while a row's tokens never depend on the other rows of the batch. So any crop
+// decodes the same whatever it shares a batch with, and rows can be moved between batches as
+// long as they are at the same position. (A crop decoded alone runs at batch 1, as before: a
+// third of the step time of batch 8, for the page with a single formula.)
 //   - crops are taken longest-expected first (ink pixels) in cohorts of kGroups * kBatch,
 //     which start together and step together, kGroups step batches per step;
 //   - when rows finish, the rows left are packed into fewer batches (their self- and
@@ -68,7 +70,11 @@ class FormulaRecognizer {
   void decode_cohort(int n, int set, std::vector<std::vector<int64_t>> &toks, cudaStream_t s,
                      const std::vector<FormulaCrop> &crops, const std::vector<int> &order, EncodeJob &next);
 
+  bool set_prep_batch(int nb);
+  bool set_step_batch(int nb);
+
   std::unique_ptr<hp::core::engine::TrtEngine> enc_, prep_, step_;
+  int prep_batch_ = 0, step_batch_ = 0;  // the batches prep_ and step_ are shaped for
   std::optional<hp::core::formula::FormulaTokenizer> tok_;
   std::string enc_out_;
   CudaStream enc_stream_;

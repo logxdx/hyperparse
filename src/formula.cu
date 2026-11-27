@@ -248,12 +248,24 @@ bool FormulaRecognizer::load(const std::string &dir) {
   for (int i = 0; i < MAXIT; ++i) pos[i] = 3LL * i;
   d_pos_ = hp::core::CudaPtr<int64_t>(MAXIT);
   CUDA_CHECK(cudaMemcpy(d_pos_.get(), pos.data(), MAXIT * sizeof(int64_t), cudaMemcpyHostToDevice));
-  // Every launch is at batch kBatch (see formula.h): the shapes never change.
-  return enc_->set_input_shape("x", dims({1, 1, kFormulaS, kFormulaS})) &&
-         prep_->set_input_shape("memory", dims({B, CTX, MEMD})) && step_->set_input_shape("tokens", dims({B, 3})) &&
-         step_->set_input_shape("pos", dims({1})) && step_->set_input_shape("kb", dims({2, B, H, MAXLEN, Dh})) &&
-         step_->set_input_shape("vb", dims({2, B, H, MAXLEN, Dh})) &&
-         step_->set_input_shape("ck", dims({2, B, H, CTX, Dh})) && step_->set_input_shape("cv", dims({2, B, H, CTX, Dh}));
+  return enc_->set_input_shape("x", dims({1, 1, kFormulaS, kFormulaS})) && step_->set_input_shape("pos", dims({1})) &&
+         set_prep_batch(B) && set_step_batch(B);
+}
+
+// Prep / step at batch nb: kBatch, or 1 for a crop decoded alone (see formula.h). The next
+// cohort's prep runs during this cohort's decode, so they are shaped separately.
+bool FormulaRecognizer::set_prep_batch(int nb) {
+  if (nb == prep_batch_) return true;
+  prep_batch_ = nb;
+  return prep_->set_input_shape("memory", dims({nb, CTX, MEMD}));
+}
+
+bool FormulaRecognizer::set_step_batch(int nb) {
+  if (nb == step_batch_) return true;
+  step_batch_ = nb;
+  return step_->set_input_shape("tokens", dims({nb, 3})) && step_->set_input_shape("kb", dims({2, nb, H, MAXLEN, Dh})) &&
+         step_->set_input_shape("vb", dims({2, nb, H, MAXLEN, Dh})) &&
+         step_->set_input_shape("ck", dims({2, nb, H, CTX, Dh})) && step_->set_input_shape("cv", dims({2, nb, H, CTX, Dh}));
 }
 
 void FormulaRecognizer::encode_step(const std::vector<FormulaCrop> &crops, const std::vector<int> &order,
@@ -285,7 +297,8 @@ void FormulaRecognizer::encode_step(const std::vector<FormulaCrop> &crops, const
   ++job.next;
   if (b == B - 1 || job.done()) {  // the step batch is complete: cross-KV prep
     CUDA_CHECK(cudaEventRecord(x_free_[x_half_], enc_stream_));
-    for (int r = b + 1; r < B; ++r)  // empty slots: row 0's memory (never read back)
+    if (!set_prep_batch(job.n == 1 ? 1 : B)) throw std::runtime_error("formula prep shape");
+    for (int r = job.n == 1 ? B : b + 1; r < B; ++r)  // empty slots: row 0's memory (never read back)
       CUDA_CHECK(cudaMemcpyAsync(d_mem_.get() + r * kMem, d_mem_.get(), sizeof(float) * kMem,
                                  cudaMemcpyDeviceToDevice, enc_stream_));
     prep_->set_tensor_address("memory", d_mem_.get());
@@ -313,6 +326,8 @@ void FormulaRecognizer::decode_cohort(int n, int set, std::vector<std::vector<in
   for (int i = 0; i < n; ++i) done[i] = 0;  // the previous cohort's kernels are over (its decode synced)
 
   CUDA_CHECK(cudaStreamWaitEvent(s, set_ready_[set]));
+  const int nb = n == 1 ? 1 : B;  // step batch size
+  if (!set_step_batch(nb)) throw std::runtime_error("formula step shape");
   std::vector<Group> gs;
   std::vector<int> spare;  // KV buffers no group holds
   for (int g = 0; g < G + 1; ++g) {
@@ -379,7 +394,7 @@ void FormulaRecognizer::decode_cohort(int n, int set, std::vector<std::vector<in
       step_->set_tensor_address("vb_out", kv(out) + kKv);
       step_->set_tensor_address("logits", d_logits_.get());
       if (!step_->execute(s)) throw std::runtime_error("formula step failed");
-      argmax_rows<<<B * 3, 256, 0, s>>>(d_logits_.get(), tok(g.slot), d_hist_.get(), g.rows, it, eos, h_eos_.get(), VOCAB);
+      argmax_rows<<<nb * 3, 256, 0, s>>>(d_logits_.get(), tok(g.slot), d_hist_.get(), g.rows, it, eos, h_eos_.get(), VOCAB);
       spare.push_back(g.kv);  // free once this step has read it (stream order)
       g.kv = out;
       ++steps_run;

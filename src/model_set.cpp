@@ -96,7 +96,7 @@ void ModelSet::synchronize() {
 //   full-page det -> CCL/JFA postprocess -> rec on the boxes found, plus a spread
 //   of extra line widths, so the column-budget packer runs multi-batch shapes;
 //   region-packed det through CropBatch (the partial-page path);
-//   one formula crop through encoder, cross-KV prep and decode.
+//   formula crops through encoder, cross-KV prep and decode, at both step batch sizes.
 // The page is white with dark word-like bars, so det finds boxes and rec and
 // formula see ink. Outputs are discarded. Measured effect: see engine.h.
 void ModelSet::warmup() {
@@ -154,7 +154,8 @@ void ModelSet::warmup() {
   if (formula_) {
     const int x0 = 120, y0 = 130, w = 560, h = 120;  // three rows of "words"
     const FormulaCrop crop{px.data() + (static_cast<size_t>(y0) * W + x0) * 3, static_cast<size_t>(W) * 3, w, h};
-    (void)formula_->run({crop}, formula_stream_);
+    (void)formula_->run({crop, crop}, formula_stream_);  // the batch-8 step
+    (void)formula_->run({crop}, formula_stream_);        // the batch-1 step of a lone crop
   }
   if (tablenet_) {
     // A 4 x 4 grid of numbers: one forward pass at a small N (kernel loading, context setup).
