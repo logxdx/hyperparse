@@ -14,15 +14,16 @@ struct ServerConfig {
   std::string host = "0.0.0.0";
   int port = 8080;
   // Drogon I/O threads. They only parse HTTP, extract the PDF and enqueue; the
-  // parse itself runs on the job thread. 4 = a sensible minimum of io_threads
+  // parse itself runs on the job threads. 4 = a sensible minimum of io_threads
   // (gpu_server_main.cpp: max(pool_size, 4)).
   int io_threads = 4;
 
-  // Requests waiting for the engine (not counting the one running). Past this,
+  // Requests waiting for the engine (not counting the running ones, up to
+  // EngineConfig::concurrent_documents, --concurrent-docs). Past this,
   // new parse/model requests get 503 SERVER_BUSY + Retry-After. Each waiting
-  // request holds its PDF in memory, so the worst case is max_queue *
-  // max_body_mb (16 * 100 MB = 1.6 GB); and at the measured 13-17 pages/s,
-  // 16 queued 10-page documents is already ~10 s of waiting.
+  // request holds its PDF in memory, so the worst case is (max_queue +
+  // concurrent_documents) * max_body_mb ((16 + 8) * 100 MB = 2.4 GB); and at
+  // 20-40 pages/s, 16 queued 10-page documents is already 4-8 s of waiting.
   int max_queue = 16;
   // A request that waited longer than this is answered 504 QUEUE_TIMEOUT
   // instead of being parsed (its client has likely given up). 0 = no limit.

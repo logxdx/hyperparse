@@ -83,7 +83,9 @@ wrote its table twice); scans turned upright (OmniParseBench rotated pages 61 �
 18 → 62); table clean-up and header bands (ParseBench tables 57.2 → 60.9, 63.2 → 68.9).
 
 Throughput through these harnesses (about one page per request, 4 requests in flight): 9–10 pages/s;
-engine time 81 ms per page; a saturated server about 20 pages/s.
+engine time 81 ms per page. A saturated server parses about 44 pages/s of one-page documents (8 in
+flight, RTX 4050 laptop), as fast as the same pages as one PDF: up to 8 documents share the GPU
+pipeline (`--concurrent-docs`).
 
 ### Stage choices
 
@@ -206,6 +208,9 @@ FP16 matches FP32 on the benchmarks above; INT8 LayoutNet is slower and loses 1.
 - **Page workers are processes, not threads.** PDFium isn't thread-safe, and
   separate processes also isolate crashes: a watchdog times out stuck pages,
   and a failed page doesn't take down the document.
+- **Documents overlap.** Concurrent parses (server requests) share one pipeline: one document
+  renders while another is on the GPU and a third is assembled, and short documents overtake
+  long ones. Errors stay with their document.
 - **Models load lazily and can unload when idle,** giving the GPU back between bursts.
 - **Model preparation runs in a child process.** It downloads from Hugging Face,
   checks SHA-256 and builds the engines, so the main process stays free of CUDA

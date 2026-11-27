@@ -63,7 +63,8 @@ void register_admin_routes(ServerContext &ctx) {
                           {"queue",
                            {{"waiting", ctx.jobs.waiting()},
                             {"running", ctx.jobs.running()},
-                            {"max_waiting", ctx.jobs.max_waiting()}}},
+                            {"max_waiting", ctx.jobs.max_waiting()},
+                            {"max_running", ctx.jobs.max_running()}}},
                           {"uptime_s", static_cast<int64_t>(up)}}));
       },
       {drogon::Get});

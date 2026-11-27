@@ -32,14 +32,14 @@ int main(int argc, char **argv) try {
   }
   hp::server::tune_glibc_arenas();
 
-  hp::server::JobQueue jobs(static_cast<size_t>(cfg.max_queue), cfg.queue_timeout);
+  hp::server::JobQueue jobs(static_cast<size_t>(cfg.max_queue), cfg.queue_timeout, engine.config().concurrent_documents);
   hp::server::ServerContext ctx{engine, jobs, cfg};
   hp::server::register_admin_routes(ctx);
   hp::server::register_parse_routes(ctx);
   hp::server::register_model_routes(ctx);
 
   HP_LOG_INFO("hyperparse_server listening", "host", std::string_view(cfg.host), "port", cfg.port, "page_workers",
-                engine.config().workers, "max_queue", cfg.max_queue, "idle_unload_s",
+                engine.config().workers, "concurrent_docs", engine.config().concurrent_documents, "max_queue", cfg.max_queue, "idle_unload_s",
                 static_cast<int>(cfg.engine.idle_unload.count() / 1000));
   hp::server::run_http_server(ctx);
 

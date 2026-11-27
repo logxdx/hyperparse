@@ -26,6 +26,7 @@ constexpr const char *kUsage =
     "  --no-warmup            don't load + warm up the models before listening\n"
     "  --models DIR           plans + dicts, or ONNX to build them from (default: HF cache + engine cache)\n"
     "  --workers N            page-worker processes (0 = auto)\n"
+    "  --concurrent-docs N    documents parsed at once, sharing the GPU pipeline (8)\n"
     "  --det-side N           text-det max side (1280)\n"
     "  --rec budget|bucket    recognizer batching (budget)\n"
     "  --no-ocr               don't load det/rec (text layer + layout only)\n"
@@ -51,7 +52,8 @@ std::string env_name(const std::string &flag) {
 
 const std::vector<std::string> kValueFlags = {
     "--host",       "--port",     "--io-threads", "--max-queue", "--queue-timeout-ms", "--max-body-mb", "--max-pages",
-    "--shutdown-grace", "--idle-unload", "--models", "--workers",  "--det-side",         "--rec"};
+    "--shutdown-grace", "--idle-unload", "--models", "--workers",  "--det-side",         "--rec",
+    "--concurrent-docs"};
 const std::vector<std::string> kSwitches = {"--no-warmup", "--no-ocr", "--no-formula", "--no-tables", "--no-ordernet"};
 
 }  // namespace
@@ -88,6 +90,7 @@ ServerConfig parse_server_config(int argc, char **argv) {
     else if (k == "--no-warmup") c.warmup = false;
     else if (k == "--models") c.engine.models.dir = next();
     else if (k == "--workers") c.engine.workers = to_int(k, next());
+    else if (k == "--concurrent-docs") c.engine.concurrent_documents = std::max(1, to_int(k, next()));
     else if (k == "--det-side") c.engine.models.det_max_side = to_int(k, next());
     else if (k == "--no-ocr") c.engine.models.ocr = false;
     else if (k == "--no-formula") c.engine.models.formula = false;

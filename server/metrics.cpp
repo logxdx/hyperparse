@@ -135,7 +135,7 @@ std::string Metrics::serialize(const Engine &engine, const JobQueue &queue) cons
 
   header(out, "hp_queue_waiting", "gauge", "Requests waiting for the engine.");
   sample(out, "hp_queue_waiting", "", static_cast<double>(queue.waiting()));
-  header(out, "hp_queue_running", "gauge", "Requests running on the engine (0 or 1).");
+  header(out, "hp_queue_running", "gauge", "Requests running on the engine (up to --concurrent-docs).");
   sample(out, "hp_queue_running", "", static_cast<double>(queue.running()));
   header(out, "hp_queue_max_waiting", "gauge", "Queue ceiling; 503 above it.");
   sample(out, "hp_queue_max_waiting", "", static_cast<double>(queue.max_waiting()));

@@ -50,10 +50,12 @@ std::string api_docs(const ServerConfig &cfg, const std::string &base) {
   std::string d;
   d += "hyperparse_server API (" + base + ")\n\n";
   d += "Parses PDFs on the GPU into layout regions, text lines, formulas (LaTeX) and\n"
-       "Markdown. One document is parsed at a time; up to " +
+       "Markdown. Up to " +
+       std::to_string(cfg.engine.concurrent_documents) +
+       " documents are parsed at once (their pages share the GPU); up to " +
        std::to_string(cfg.max_queue) +
-       " more wait in a queue. Beyond that,\n"
-       "requests get 503 SERVER_BUSY with a Retry-After header.\n\n";
+       "\nmore wait in a queue and start in arrival order. Beyond that, requests get\n"
+       "503 SERVER_BUSY with a Retry-After header.\n\n";
   d += "ENDPOINTS\n" + table("  ");
 
   d += "\nPARSING: POST /parse, POST /parse/stream\n";

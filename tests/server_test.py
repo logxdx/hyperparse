@@ -145,14 +145,17 @@ def test_stream(port, medium):
 
 
 def test_queue(port, medium):
-    results = [None] * 6
+    running = as_json(request(port, "GET", "/health")[2])["queue"]["max_running"]
+    n = running + 2 + 3  # `running` parsing + 2 waiting (--max-queue 2) -> 3 rejected
+    results = [None] * n
 
     def one(i):
+        sent = time.time()
         st, h, d = post_pdf(port, "/parse", medium)
-        results[i] = (st, h, as_json(d))
+        results[i] = (st, h, as_json(d), sent)
 
     threads = []
-    for i in range(6):  # 1 running + 2 waiting (--max-queue 2) -> 3 rejected
+    for i in range(n):
         t = threading.Thread(target=one, args=(i,))
         t.start()
         threads.append(t)
@@ -161,11 +164,14 @@ def test_queue(port, medium):
         t.join()
     ok = [r for r in results if r[0] == 200]
     busy = [r for r in results if r[0] == 503]
-    check(len(ok) == 3 and len(busy) == 3, f"queue: {len(ok)} served, {len(busy)} rejected")
+    check(len(ok) == running + 2 and len(busy) == 3, f"queue: {len(ok)} served ({running} at once), {len(busy)} rejected")
     check(all(r[2]["error"]["code"] == "SERVER_BUSY" and r[1].get("retry-after") == "1" for r in busy),
           "rejections: SERVER_BUSY + Retry-After")
-    waits = [r[2]["stats"]["queue_ms"] for r in results if r[0] == 200]
-    check(waits == sorted(waits) and waits[-1] > 1000, f"served in arrival order (queue_ms {[round(w) for w in waits]})")
+    # Start time = send time + queue wait (client clock; 50 ms slack for the request upload).
+    starts = [r[3] + r[2]["stats"]["queue_ms"] / 1e3 for r in ok]
+    waits = [r[2]["stats"]["queue_ms"] for r in ok]
+    check(all(b > a - 0.05 for a, b in zip(starts, starts[1:])) and max(waits) > 1000,
+          f"started in arrival order (queue_ms {[round(w) for w in waits]})")
     return len(busy)
 
 

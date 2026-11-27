@@ -46,7 +46,10 @@ nlohmann::json status_json(const ServerContext &ctx) {
         {"last_unload_ms", l.last_unload_ms},
         {"last_unload", {{"models_ms", l.last_unload_models_ms}, {"unpin_ms", l.last_unload_unpin_ms}}}}},
       {"queue",
-       {{"waiting", ctx.jobs.waiting()}, {"running", ctx.jobs.running()}, {"max_waiting", ctx.jobs.max_waiting()}}}};
+       {{"waiting", ctx.jobs.waiting()},
+        {"running", ctx.jobs.running()},
+        {"max_waiting", ctx.jobs.max_waiting()},
+        {"max_running", ctx.jobs.max_running()}}}};
 }
 
 // Queue `op` on the engine; answer with the status after it ran.
@@ -65,7 +68,7 @@ void queued_op(ServerContext &ctx, Callback &&callback, void (Engine::*op)(), co
       } catch (...) {
         (*cb)(error_response(classify(std::current_exception(), route)));
       }
-    });
+    }, /*exclusive=*/true);
   } catch (const hp::core::PoolExhaustedError &) {
     Metrics::instance().record_rejected();
     (*cb)(error_response(queue_full(ctx)));
