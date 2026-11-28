@@ -1,7 +1,8 @@
 # hyperparse
 
 A GPU PDF parser in C++/CUDA. It turns PDFs into layout regions, text lines,
-LaTeX formulas and Markdown, at about 16 pages per second on a 6 GB laptop GPU.
+LaTeX formulas and Markdown, at 24–65 pages per second on a 6 GB laptop GPU (scans and
+formula-heavy papers at the low end, born-digital documents at the high end).
 
 ## Why
 
@@ -39,9 +40,10 @@ Measured on an RTX 4050 Laptop GPU (6 GB):
 
 | Set | Pages | Throughput | Notes |
 |---|---|---|---|
-| IDL scans ([pixparse/idl-wds](https://huggingface.co/datasets/pixparse/idl-wds)) | 751 | 19.3 pages/s | word F1 0.894 against AWS Textract's OCR of the same pages |
-| Scientific papers | 60 | 15.2 pages/s | 98 formulas, 30 tables |
-| Mixed documents | 100 | 14.0 pages/s | 118 formulas, 22 tables |
+| Server, 300 one-page documents, 8 in flight | 300 | ~64 pages/s | p50 latency ~124 ms |
+| Mixed documents (ParseBench-1 sample, one PDF) | 302 | 62–66 pages/s | born-digital and scanned pages |
+| Scanned pages | 98 | ~24 pages/s | every page OCR'd |
+| arXiv papers | 100 | ~24.5 pages/s | formula-heavy |
 
 With the models loaded it peaks at about 3.4 GB of GPU memory. They unload after an
 idle timeout and reload on the next request in about 0.6 s. Full numbers:
@@ -63,16 +65,16 @@ OmniParseBench 74.8, ParseBench-2 59.3).
 
 | Benchmark | hp | LiteParse + OCRia-nano-1 | Indra 1.1.2 | Marker (fast) | LiteParse (Tesseract) |
 |---|---|---|---|---|---|
-| [ParseBench-2](https://huggingface.co/datasets/llamaindex/ParseBench-2) (4,317 pages) | **61.7** | 59.2 | 55.1 | 52.5 | 48.7 |
+| [ParseBench-2](https://huggingface.co/datasets/llamaindex/ParseBench-2) (4,317 pages) | **61.8** | 59.2 | 55.1 | 52.5 | 48.7 |
 | [OmniParseBench](https://github.com/datalab-to/omni_parse_bench) v1.7 (2,937 pages) | **76.8** | 74.8 | 70.9 | 69.8 | 42.3 |
 | [ParseBench-1](https://huggingface.co/datasets/llamaindex/ParseBench) (2,079 docs) | **56.5** | 52.7 | 42.6 | 40.4 | 40.5 |
-| [olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench) (1,403 PDFs) | **65.0** | 60.9 | 60.8 | 60.8 | 45.7 |
-| [BHL IMPACT](https://huggingface.co/datasets/finebooks/bhl-impact-gt) CER, lower is better (2,165 pages) | 0.085 | **0.048** | 0.062 | 0.067 | 0.275 |
+| [olmOCR-bench](https://huggingface.co/datasets/allenai/olmOCR-bench) (1,403 PDFs) | **65.9** | 60.9 | 60.8 | 60.8 | 45.7 |
+| [BHL IMPACT](https://huggingface.co/datasets/finebooks/bhl-impact-gt) CER, lower is better (2,165 pages) | 0.050 | **0.048** | 0.062 | 0.067 | 0.275 |
 
-ParseBench-2 by dimension: text 70.3, formatting 81.2, tables 60.9, charts 5.0, layout 82.1, forms 70.4
-(LiteParse + OCRia-nano-1: 68.5 / 82.2 / 59.5 / 3.1 / 72.4 / 69.8). OmniParseBench: text 64.9, tables
-73.4, layout 92.1. olmOCR-bench: arXiv math 61.9, multi-column 74.1, tables 75.4, headers / footers 94.6,
-long tiny text 76.2, old scans 26.2, old-scan math 17.9. hp has no chart model (charts stay figures) and
+ParseBench-2 by dimension: text 70.7, formatting 81.3, tables 61.0, charts 4.9, layout 82.4, forms 70.4
+(LiteParse + OCRia-nano-1: 68.5 / 82.2 / 59.5 / 3.1 / 72.4 / 69.8). OmniParseBench: text 65.1, tables
+73.4, layout 92.1. olmOCR-bench: arXiv math 61.9, multi-column 75.9, tables 75.5, headers / footers 94.6,
+long tiny text 81.2, old scans 26.2, old-scan math 17.9. hp has no chart model (charts stay figures) and
 its OCR is weakest on handwriting and historical print. GPU / cloud VLM parsers score 79–87 on
 ParseBench-2 (OCRia-1, Reducto, Datalab, Chandra 2).
 
@@ -80,12 +82,12 @@ What moved these numbers, from the previous build (ParseBench-2 / ParseBench-1 /
 olmOCR-bench): 59.5 / 51.9 / 70.9 / 60.1 before; D-FINE duplicate boxes dropped (a duplicate Table box
 wrote its table twice); scans turned upright (OmniParseBench rotated pages 61 → 78.5); inline styles
 (ParseBench formatting 75.3 → 81.2, 36.6 → 53.5); TeX math from the PDF's glyphs (olmOCR arXiv math
-18 → 62); table clean-up and header bands (ParseBench tables 57.2 → 60.9, 63.2 → 68.9).
+18 → 62); table clean-up and header bands (ParseBench tables 57.2 → 60.9, 63.2 → 68.9); detected OCR
+lines merged only inside one layout region (BHL CER 0.085 → 0.050, olmOCR-bench 65.0 → 65.9).
 
-Throughput through these harnesses (about one page per request, 4 requests in flight): 9–10 pages/s;
-engine time 81 ms per page. A saturated server parses about 44 pages/s of one-page documents (8 in
-flight, RTX 4050 laptop), as fast as the same pages as one PDF: up to 8 documents share the GPU
-pipeline (`--concurrent-docs`).
+Throughput through these harnesses (about one page per request, 4 requests in flight): 18–20 pages/s.
+A saturated server parses about 64 pages/s of one-page documents (8 in flight, RTX 4050 laptop), as
+fast as the same pages as one PDF: up to 8 documents share the GPU pipeline (`--concurrent-docs`).
 
 ### Stage choices
 
@@ -135,14 +137,28 @@ How the other candidates compared, per stage, on the same pages:
 
 ### Throughput
 
-| Set | Pages | Pages/s | Routes (native / partial / full OCR) | Formulas | Tables |
-|---|---|---|---|---|---|
-| IDL scans | 751 | **19.3** | 3 / 4 / 744 | 26 | 198 |
-| Scientific papers | 60 | **15.2** | 14 / 37 / 9 | 97 | 30 |
-| OmniDocBench table pages (images) | 100 | **14.6** | 0 / 0 / 100 | 3 | 104 |
-| Mixed documents | 100 | **14.0** | 19 / 36 / 45 | 117 | 22 |
-| olmOCR-bench subset | 140 | **12.9** | 21 / 52 / 67 | 187 | 31 |
-| OmniDocBench (images, ~2000 px) | 100 | **9.9** | 0 / 0 / 100 | 104 | 29 |
+After the GPU optimization pass (November 2026), against the build before it, same machine:
+
+| Set | Pages | Before | **Now** |
+|---|---|---|---|
+| Server, 300 one-page documents, 8 in flight | 300 | 20.0 pages/s (p50 333 ms) | **~64** (p50 ~124 ms) |
+| Mixed documents (ParseBench-1 sample, one PDF) | 302 | 44.2 | **62–66** |
+| Scanned pages | 98 | 16.4 | **~24** |
+| arXiv papers (formula-heavy) | 100 | 10.3 | **~24.5** |
+| Benchmark harnesses (olmOCR-bench, OmniParseBench, BHL) | – | 9–10 | **18–20** |
+
+What did it:
+- **Text detection post-processing:** warp-aggregated atomics, 5.7 → 0.25 ms per page. Detection and
+  recognition are pipelined across pages.
+- **Documents overlapped in one long-lived pipeline** in the server.
+- **Formula decoder:** fixed batch 8, length-sorted cohorts with row compaction, asynchronous
+  end-of-sequence checks, host-side shapes, and the key-value cache passed only up to the slots in use.
+- **Text recognition:** a logits plan with a fused FP16 argmax.
+- **D-FINE layout:** built with an all-FP16 backbone, 12.0 → 6.4 ms per page.
+- **Threads and streams:** formulas on their own thread, 3 assembly threads, high-priority page
+  streams. Server tail latency on mixed loads dropped from p99 13–15 s to 0.5–0.7 s.
+
+The GPU is 95–100% busy during parses. Accuracy is unchanged or better (table above).
 
 Per-page costs on these runs (the stages overlap: workers, GPU thread and assembly thread run
 concurrently):
@@ -151,8 +167,9 @@ concurrently):
 |---|---|---|
 | Text layer + routing | page workers | 0.5–8 ms per page |
 | Render | page workers | 14–30 ms per page (80–90 ms for ~2000 px images) |
-| OCR (det + rec) | GPU | 46–91 ms per OCR page (det 10–18, rec 32–73) |
-| Formulas | assembly thread | 37–70 ms per batch of up to 8 |
+| Layout (D-FINE) | GPU | ~6.5 ms per page |
+| OCR (det + rec) | GPU | ~35 ms per scanned page (det ~7.5, rec ~27) |
+| Formulas | formula thread | batches of up to 8, across pages |
 | LayoutNet (features + net + decode) | assembly thread | 8–24 ms per page with a table |
 | OrderNet (features + net + decode + Markdown) | assembly thread | 0.9–3.2 ms per page |
 
